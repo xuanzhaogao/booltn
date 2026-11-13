@@ -39,7 +39,7 @@ import time
 
 from .reduce import CDCL, XorSystem, LPRelaxation, detect_xors
 from .slicer import _big_labels
-from .tree_utils import recompute_outputs, complexity, prune_tree
+from .tree_utils import recompute_outputs, complexity, prune_tree, log2sumexp2
 
 
 @dataclasses.dataclass
@@ -352,7 +352,7 @@ class BranchSolver:
                     return ("unsat", l3) if st2 else ("forced", l3)
                 _, _, _, tc2, sc2 = self._measure(l2)
                 kids.append((l2, tc2, sc2))
-            score = math.log2(sum(2.0 ** (k[1] + max(0, k[2] - self.sc_leaf)) for k in kids))
+            score = log2sumexp2([k[1] + max(0, k[2] - self.sc_leaf) for k in kids])
             if best is None or score < best[0]:
                 best = (score, v, kids)
         return "branch", sorted(best[2], key=lambda k: k[1])

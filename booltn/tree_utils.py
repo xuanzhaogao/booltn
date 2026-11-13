@@ -70,6 +70,12 @@ def prune_tree(d, keep):
     return rec(d)
 
 
+def log2sumexp2(xs):
+    """log2(sum 2^x) without overflow (x can exceed 1023 for huge networks)."""
+    m = max(xs)
+    return m + math.log2(sum(2.0 ** (x - m) for x in xs))
+
+
 def contractions(d, ixs):
     """List of (B, M, N, K) label counts for every pairwise contraction (post-order)."""
     acc = []
@@ -90,7 +96,7 @@ def contractions(d, ixs):
 def complexity(d, ixs):
     """(tc, sc) in log2 units, omeco convention: tc = log2 sum 2^(B+M+N+K), sc = max tensor size."""
     cs = contractions(d, ixs)
-    tc = math.log2(sum(2.0 ** (b + m + n + k) for b, m, n, k in cs)) if cs else 0.0
+    tc = log2sumexp2([b + m + n + k for b, m, n, k in cs]) if cs else 0.0
     sc = max([b + m + n for b, m, n, k in cs] + [len(set(ix)) for ix in ixs])
     return tc, sc
 
