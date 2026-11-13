@@ -90,7 +90,7 @@ labels of `sat_einsum`. Tree files hold `{"tree": ..., "sliced": [...]}` (`order
 | `count_engine` | `CountTree` and `CountSlicer` (int8 mod-p plan), `count_models` (CRT; `mode="stable"` or `"rigorous"`), `profile_tree` |
 | `ordering` | `optimize_order` (omeco TreeSA + TreeSASlicer), `prepare_tree`, `load_tree` / `save_tree` |
 | `slicer` | `greedy_slice`: slicing for a tree from any optimizer, with cost tc or modeled GPU time |
-| `tree_utils` | Contraction shapes (B, M, N, K), tc/sc, GPU time models (`gpu_time_v2`, fitted on the H100) |
+| `tree_utils` | Contraction shapes (B, M, N, K), tc/sc, GPU time models (`h100_time`, fitted on the H100) |
 | `satgen` | Random and grid k-SAT, DIMACS input/output, `sat_einsum` |
 | `hard_families` | Tseitin grids, mutilated chessboard, plaquette CSP, noisy Tseitin |
 | `card_detect` | CNF → OPB with syntactically detected cardinality constraints (`python -m booltn.card_detect in.cnf out.opb`) |

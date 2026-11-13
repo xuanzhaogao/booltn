@@ -5,7 +5,7 @@ Modules (import what you need; nothing is loaded eagerly):
   count_engine   mod-p int8 contraction (CountTree, CountSlicer) + CRT: count_models    (exact #SAT)
   ordering       omeco TreeSA + slicing, tree JSON files
   slicer         greedy slicer for any tree (tc or modeled GPU time as the cost)
-  tree_utils     contraction lists, tc/sc, GPU cost models (gpu_time_v2)
+  tree_utils     contraction lists, tc/sc, GPU cost models (h100_time)
   satgen         random / grid k-SAT, DIMACS I/O, clause network (sat_einsum)
   hard_families  Tseitin grids, mutilated chessboard, plaquette CSP
   card_detect    CNF -> OPB with detected cardinality constraints

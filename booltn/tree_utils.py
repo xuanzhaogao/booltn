@@ -98,11 +98,11 @@ def tree_gpu_time(d, ixs, model=GPU_MODEL):
 
 
 # ---------------------------------------------------------------------------
-# GPU cost model v2: fitted to the booltn kernels on H100 PCIe (results/bench_kernels_model2.json)
+# H100 cost model ("h100"): fitted to the booltn kernels on H100 PCIe (booltn-gpu: results/cost_model/bench_kernels_model2.json)
 #   per large contraction = launches + permutes of both operands + GEMM (best of cc / tc)
 #   small contractions (out rank <= 14) run batched per tree level -> ~free
 # ---------------------------------------------------------------------------
-GPU_MODEL_V2 = dict(
+H100_MODEL = dict(
     launch=4e-6,             # per kernel launch inside a CUDA graph (s)
     perm_bw_bits=8.0e12,     # permutation throughput, bits/s each way (~1 TB/s)
     cc_bit=6.25e-14,         # cc: s per bit moved (A+B+C)
@@ -115,7 +115,7 @@ GPU_MODEL_V2 = dict(
 )
 
 
-def gpu_time_v2(B, M, N, K, model=GPU_MODEL_V2, small=False):
+def h100_time(B, M, N, K, model=H100_MODEL, small=False):
     """Modeled seconds for one pairwise contraction with label counts (B, M, N, K)."""
     if small:
         return model["small_cell"] * 2.0 ** (B + M + N + K)
@@ -132,10 +132,14 @@ def gpu_time_v2(B, M, N, K, model=GPU_MODEL_V2, small=False):
     return 3 * model["launch"] + perm + best
 
 
-def tree_gpu_time_v2(d, ixs, model=GPU_MODEL_V2):
+def tree_h100_time(d, ixs, model=H100_MODEL):
     """Total modeled seconds for one contraction of the tree (one slice)."""
     total = 0.0
     for (B, M, N, K) in contractions(d, ixs):
         small = (B + M + N) <= model["small_rank"]
-        total += gpu_time_v2(B, M, N, K, model, small=small)
+        total += h100_time(B, M, N, K, model, small=small)
     return total
+
+
+# names before the gpu2 -> h100 rename
+GPU_MODEL_V2, gpu_time_v2, tree_gpu_time_v2 = H100_MODEL, h100_time, tree_h100_time

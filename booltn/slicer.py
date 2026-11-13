@@ -2,16 +2,16 @@
 
 Repeatedly slices the label that minimizes  2^(#sliced) * cost(tree with sliced labels removed)
 among labels of tensors that exceed the space target, until max tensor rank <= sc_target.
-cost = "tc" (2^tc per slice) or "gpu" (tree_gpu_time_v2 per slice).
+cost = "tc" (2^tc per slice) or "h100" (modeled H100 time per slice, tree_h100_time; old name "gpu").
 """
-from .tree_utils import recompute_outputs, contractions, complexity, tree_gpu_time_v2
+from .tree_utils import recompute_outputs, contractions, complexity, tree_h100_time
 
 
 def _cost(d, ixs, kind):
     if kind == "tc":
         cs = contractions(d, ixs)
         return sum(2.0 ** sum(c) for c in cs)
-    return tree_gpu_time_v2(d, ixs)
+    return tree_h100_time(d, ixs)
 
 
 def _big_labels(d, ixs, sc_target):
@@ -30,7 +30,7 @@ def _big_labels(d, ixs, sc_target):
     return sorted(w, key=lambda l: -w[l])
 
 
-def greedy_slice(tree, ixs, sc_target, kind="gpu", max_candidates=24, verbose=False):
+def greedy_slice(tree, ixs, sc_target, kind="h100", max_candidates=24, verbose=False):
     sliced = []
     while True:
         ixs_sl = [[l for l in ix if l not in set(sliced)] for ix in ixs]
