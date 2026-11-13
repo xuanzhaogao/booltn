@@ -23,7 +23,7 @@ Limits:
 * The cost is set by the treewidth. Wide formulas, such as random 3-SAT with n ≥ 100 for #SAT, are
   easier for CPU solvers.
 * Counts above about 10^109 (the range of the 8-bit moduli) need 16-bit residues, which take twice the
-  memory and 2–4× the time per pass.
+  memory and about twice the time per pass (for twice the bits).
 * Each crafted SAT family has a CPU specialist that is faster: Gauss for parity, LP for the
   chessboard, cardinality detection for sgen.
 
