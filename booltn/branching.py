@@ -191,6 +191,12 @@ class BranchSolver:
                 res.append(rem)
         return keep, res
 
+    def _tcsc(self, lits):
+        """(tc, sc) of the residual network under lits (= _measure(lits)[3:])."""
+        if getattr(self, "_tm", None) is not None:
+            return self._tm.tcsc(lits)
+        return self._measure(lits)[3:]
+
     def _measure(self, lits):
         """Residual network, its tree (root tree pruned) and (tc, sc)."""
         keep, res = self._residual(lits)
@@ -297,6 +303,8 @@ class BranchSolver:
             self.tree = min(cands, key=lambda c: complexity(c, ixs)[::-1])
         self.tree = recompute_outputs(self.tree, ixs, [])
         self.st["root_tc"], self.st["root_sc"] = complexity(self.tree, ixs)
+        from . import measure as MS        # lookahead (tc, sc) in C (kernels/measure.c), same numbers as _measure
+        self._tm = MS.TreeMeasure(self.tree, self.clauses, self.n) if MS.available() else None
         self.st["t_order"] = time.time() - t
         self.log(f"root tree: tc 2^{self.st['root_tc']:.1f} sc 2^{self.st['root_sc']} ({self.st['t_order']:.1f}s)")
         return None
@@ -434,7 +442,7 @@ class BranchSolver:
                     self.st["failed_literals"] += 1
                     st2, l3 = self._fixpoint(lits + [-lit])
                     return ("unsat", l3) if st2 else ("forced", l3)
-                _, _, _, tc2, sc2 = self._measure(l2)
+                tc2, sc2 = self._tcsc(l2)
                 kids.append((l2, tc2, sc2, lit))
             score = log2sumexp2([k[1] + max(0, k[2] - self.sc_leaf) for k in kids])
             if best is None or score < best[0]:
