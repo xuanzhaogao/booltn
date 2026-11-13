@@ -328,7 +328,7 @@ class BranchSolver:
         self.st["t_leaf"] += time.time() - t
         return c << (self._nfree(lits) - len(used))
 
-    def _submit_leaf(self, res, d, lits):
+    def _submit_leaf(self, res, d, lits, tc=0.0):
         """Asynchronous leaf on the pool -> appended to self.pending as (future, shift)."""
         from . import multigpu as MG
         self.st["leaves"] += 1
@@ -343,10 +343,10 @@ class BranchSolver:
             else:
                 fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode,
                                        self.count_moduli)
-            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits), key))
+            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits, tc), key))
         else:
             self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits,
-                                 (self._depth, self._splits), None))
+                                 (self._depth, self._splits, tc), None))
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
@@ -356,7 +356,7 @@ class BranchSolver:
         t = time.time()
         got, out = 0, None
         while self.pending:
-            fut, shift, lits, (depth, splits), key = self.pending[0]
+            fut, shift, lits, (depth, splits, tc), key = self.pending[0]
             if not fut.done() and not block and len(self.pending) <= keep:
                 break
             try:
@@ -374,8 +374,17 @@ class BranchSolver:
                 break
             self.pending.pop(0)
             if self.mode == "count":
+                info = None
+                if isinstance(r, tuple):        # (count, info) from a GPU worker; a journaled leaf is a bare count
+                    r, info = r
                 self._remember(key, r)
                 got += r << shift
+                self._work_done += 2.0 ** tc
+                if info is not None:
+                    self.log(f"leaf tc 2^{tc:.1f}: {info['s']:.0f} s on GPU {info['gpu']}, {info['primes']} passes "
+                             f"({info['primes16']} 16-bit, {info['extra_sliced16']} extra sliced labels); "
+                             f"leaves done {self.st['leaves'] - len(self.pending)}, journal {len(self.cache)}, "
+                             f"leaf work 2^{math.log2(self._work_done):.2f} of root tc 2^{self.st['root_tc']:.2f}")
             elif r:
                 out = ("SAT", None)
                 break
@@ -427,6 +436,7 @@ class BranchSolver:
         total = 0
         counting = self.mode == "count"
         self.pending = []
+        self._work_done = 0.0      # sum of 2^tc over finished leaves (progress, compare with the root tc)
         self.st["leaf_splits"] = 0
         while stack or (self.pool is not None and self.pending):
             if not stack:              # only asynchronous leaves left: they may re-queue split nodes
@@ -486,7 +496,7 @@ class BranchSolver:
                 if sc <= self.sc_leaf and not force:
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
                     if self.pool is not None:
-                        self._submit_leaf(res, d, lits)
+                        self._submit_leaf(res, d, lits, tc)
                         break
                     if counting:
                         try:

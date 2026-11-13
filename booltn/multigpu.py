@@ -151,8 +151,13 @@ def _w_leaf_decide(res, flat):
 
 
 def _w_leaf_count(res, nused, flat, mode, moduli=None):
+    """(count, info): info has the wall time `s`, the GPU and count_models' info (passes, 16-bit passes, ...)."""
+    import time
     from .count_engine import count_models
-    return count_models(res, nused, unflatten_tree(flat), mode=mode, primes=moduli)[0]
+    t = time.time()
+    c, info = count_models(res, nused, unflatten_tree(flat), mode=mode, primes=moduli)
+    info.update(s=time.time() - t, gpu=os.environ.get("CUDA_VISIBLE_DEVICES"))
+    return c, info
 
 
 def parse_gpus(spec):
