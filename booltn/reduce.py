@@ -53,6 +53,7 @@ class CDCL:
             self.s.conf_budget(int(budget))
             res = self.s.solve_limited(assumptions=list(lits))
         model = self.s.get_model() if res else None
+        self.last_by = "cadical" if res is not None else None    # which solver decided the last probe
         if res is None and self.cms is not None and (cms_confl or cms_time):
             kw = {}
             if cms_confl:
@@ -62,6 +63,7 @@ class CDCL:
             sat, sol = self.cms.solve(assumptions=list(lits), **kw)
             if sat is not None:
                 res = sat
+                self.last_by = "cms"
                 model = [i if sol[i] else -i for i in range(1, len(sol)) if sol[i] is not None] if sat else None
         self.time += time.time() - t
         return res, model

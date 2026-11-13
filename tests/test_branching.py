@@ -80,6 +80,28 @@ def main():  # guarded: the GPU pool spawns workers that re-import this file
         print(f"{'PASS' if good else 'FAIL'} leaf cache {'pool  ' if use_pool else 'serial'} count {r2.count} (brute force "
               f"{want}); stopped run journaled {r2.stats['cache_size']}, resumed run reused {r2.stats['leaves_cached']} of "
               f"{r2.stats['leaves']}, third run reused {r3.stats['leaves_cached']} of {r3.stats['leaves']}")
+    # cubes: the branching decisions of the closed nodes of an UNSAT run must partition the assignments (pairwise
+    # clashing, measures summing to one), every CNF + cube must be UNSAT for minisat, one cube per GPU leaf, and the
+    # leaf="skip" enumeration (no leaves decided) must write the same cubes
+    import json
+    from fractions import Fraction
+    cl, n = random_ksat(40, 180, 3, 3), 40      # 13 nodes, 4 leaves at sc_leaf 20
+    with tempfile.TemporaryDirectory() as tmp:
+        kw = dict(sc_leaf=20, cdcl_root=0, cdcl_node=0, use_xor=False, use_lp=False, ntrials=1, niters=5)
+        r = BranchSolver(cl, n, cubes=os.path.join(tmp, "gpu.jsonl"), **kw).solve()
+        BranchSolver(cl, n, cubes=os.path.join(tmp, "skip.jsonl"), leaf="skip", **kw).solve()
+        recs = [json.loads(l) for l in open(os.path.join(tmp, "gpu.jsonl"))]
+        same = open(os.path.join(tmp, "gpu.jsonl")).read() == open(os.path.join(tmp, "skip.jsonl")).read()
+    cubes = [set(c["dec"]) for c in recs]
+    disjoint = all(any(-l in cubes[j] for l in cubes[i]) for i in range(len(cubes)) for j in range(i + 1, len(cubes)))
+    cover = sum(Fraction(1, 2 ** len(c)) for c in cubes) == 1
+    each = all(truth(cl + [[l] for l in c]) == "UNSAT" for c in cubes)
+    nleaf = sum(c["why"] == "leaf" for c in recs)
+    good = (truth(cl) == "UNSAT" and r.status == "UNSAT" and disjoint and cover and each and same
+            and nleaf == r.stats["leaves"] > 0)
+    ok &= good
+    print(f"{'PASS' if good else 'FAIL'} cubes: {len(cubes)} ({nleaf} GPU leaves), partition {disjoint and cover}, "
+          f"all CNF + cube UNSAT {each}, skip enumeration identical {same}")
     print("ALL PASSED" if ok else "SOME FAILED")
     sys.exit(0 if ok else 1)
 

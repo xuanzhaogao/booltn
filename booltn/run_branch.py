@@ -31,7 +31,10 @@ def main():
                     help="root contraction order: omeco (auto/treesa/greedy), GPU TreeSA (gpu, needs treesa_gpu), "
                          "or both, keeping the lower tc (best)")
     ap.add_argument("--tree", default=None, help="contraction tree of the root network (JSON {tree})")
-    ap.add_argument("--leaf", choices=["gpu", "cdcl"], default="gpu")
+    ap.add_argument("--leaf", choices=["gpu", "cdcl", "skip"], default="gpu",
+                    help="skip: enumerate the branching tree only (leaves taken as UNSAT; with --cubes)")
+    ap.add_argument("--cubes", default=None, help="write the branching decisions of every closed node (JSON lines) "
+                    "for an independent CNF + cube check of an UNSAT answer")
     ap.add_argument("--time-limit", type=float, default=3600)
     ap.add_argument("--count", action="store_true", help="exact model counting (#SAT) instead of decision")
     ap.add_argument("--gpus", default=None, help="leaves on several GPUs: k (first k visible) or a list like 0,1,2")
@@ -53,7 +56,8 @@ def main():
                          cdcl_node=a.cdcl_node, lp_max_depth=a.lp_max_depth, candidates=a.candidates, order=a.order,
                          tree=tree, leaf=a.leaf, time_limit=a.time_limit, mode="count" if a.count else "decide",
                          pool=pool, cms_root_time=a.cms_root_time, cms_node_confl=a.cms_node,
-                         mip_root_time=a.mip_root_time, leaf_cache=a.leaf_cache, verbose=a.verbose).solve()
+                         mip_root_time=a.mip_root_time, leaf_cache=a.leaf_cache, cubes=a.cubes,
+                         verbose=a.verbose).solve()
     finally:
         if pool is not None:
             pool.close()

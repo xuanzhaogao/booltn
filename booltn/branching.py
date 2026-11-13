@@ -86,9 +86,13 @@ class BranchSolver:
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
                  cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, max_splits=16, mip_root_time=None,
-                 leaf_cache=None, verbose=0):
+                 leaf_cache=None, cubes=None, verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
-        continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
+        continues (decide: the first SAT leaf ends the search; count: leaf counts are summed).
+        cubes: file that gets one JSON line per closed node: its branching decisions (literals, DIMACS) and why it
+        was closed (leaf / prop / xor / lp / cdcl / failed / empty / xor_count). The cubes partition the space below
+        the root, so a CNF + cube check with any solver verifies an UNSAT answer independently of the leaves.
+        leaf="skip" enumerates the branching tree without deciding leaves (every leaf taken as UNSAT)."""
         assert mode in ("decide", "count")
         self.pool = pool
         self.cms_root_time, self.cms_node_confl = cms_root_time, cms_node_confl
@@ -109,6 +113,8 @@ class BranchSolver:
         self.leaf = leaf
         self.time_limit, self.max_nodes = time_limit, max_nodes
         self.verbose = verbose
+        self.cubes = open(cubes, "w") if cubes else None
+        self._dec = ()
         self.st = dict(nodes=0, leaves=0, branches=0, failed_literals=0, max_depth=0,
                        pruned=dict(prop=0, xor=0, lp=0, cdcl=0), xor_closed=0, root_sc=None, root_tc=None,
                        t_root=0.0, t_order=0.0, t_reduce=0.0, t_select=0.0, t_leaf=0.0, leaf_sc_max=0)
@@ -138,6 +144,10 @@ class BranchSolver:
                 f.write(json.dumps(dict(key=key, count=str(count))) + "\n")
 
     # ------------------------------------------------------------------------------------------
+    def _cube(self, why):
+        if self.cubes is not None:
+            self.cubes.write(json.dumps(dict(dec=list(self._dec), why=why, depth=self._depth)) + "\n")
+
     def log(self, *a):
         if self.verbose:
             print(f"[{time.time() - self.t0:8.2f}s]", *a, flush=True)
@@ -226,6 +236,7 @@ class BranchSolver:
                 return self._unsat("lp")
         if self.cdcl_root:
             res, model = self.cdcl.probe(lits, self.cdcl_root, cms_time=self.cms_root_time)
+            self.st["root_probe_by"] = self.cdcl.last_by     # cadical / cms (CryptoMiniSat, Gauss-Jordan) / None
             if res is True and self.mode == "decide":
                 return Result("SAT", "cdcl", self.st, model)
             if res is False:
@@ -343,10 +354,11 @@ class BranchSolver:
             else:
                 fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode,
                                        self.count_moduli)
-            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits, tc), key))
+            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits, tc, self._dec),
+                                 key))
         else:
             self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits,
-                                 (self._depth, self._splits, tc), None))
+                                 (self._depth, self._splits, tc, self._dec), None))
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
@@ -356,7 +368,7 @@ class BranchSolver:
         t = time.time()
         got, out = 0, None
         while self.pending:
-            fut, shift, lits, (depth, splits, tc), key = self.pending[0]
+            fut, shift, lits, (depth, splits, tc, dec), key = self.pending[0]
             if not fut.done() and not block and len(self.pending) <= keep:
                 break
             try:
@@ -368,7 +380,7 @@ class BranchSolver:
                 self.pending.pop(0)
                 if self.mode == "count" and splits < self.max_splits:   # leaf count failed: split this leaf
                     self.st["leaf_splits"] += 1
-                    self._stack.append((lits, depth, True, splits + 1))
+                    self._stack.append((lits, depth, True, splits + 1, dec))
                     continue
                 out = ("ERR", f"{type(e).__name__}: {e}")
                 break
@@ -395,7 +407,9 @@ class BranchSolver:
     def _leaf(self, res, d):
         t = time.time()
         self.st["leaves"] += 1
-        if self.leaf == "gpu":
+        if self.leaf == "skip":
+            sat = False
+        elif self.leaf == "gpu":
             from . import engine as E
             sat = E.decide(res, d, [], early_exit=False)[0]
         else:   # "cdcl": exact CDCL on the residual (for testing without an H100)
@@ -421,7 +435,7 @@ class BranchSolver:
                     st2, l3 = self._fixpoint(lits + [-lit])
                     return ("unsat", l3) if st2 else ("forced", l3)
                 _, _, _, tc2, sc2 = self._measure(l2)
-                kids.append((l2, tc2, sc2))
+                kids.append((l2, tc2, sc2, lit))
             score = log2sumexp2([k[1] + max(0, k[2] - self.sc_leaf) for k in kids])
             if best is None or score < best[0]:
                 best = (score, v, kids)
@@ -433,7 +447,8 @@ class BranchSolver:
         r = self._root()
         if r is not None:
             return self._finish(r)
-        stack = self._stack = [(self.root_lits, 0, False, 0)]  # (literals, depth, force a branch, overflow splits)
+        # (literals, depth, force a branch, overflow splits, branching decisions)
+        stack = self._stack = [(self.root_lits, 0, False, 0, ())]
         total = 0
         counting = self.mode == "count"
         self.pending = []
@@ -463,8 +478,8 @@ class BranchSolver:
                 total += val
             if time.time() - self.t0 > self.time_limit or self.st["nodes"] >= self.max_nodes:
                 return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
-            lits, depth, force, splits = stack.pop()
-            self._depth, self._splits = depth, splits
+            lits, depth, force, splits, dec = stack.pop()
+            self._depth, self._splits, self._dec = depth, splits, dec
             self.st["nodes"] += 1
             self.st["max_depth"] = max(self.st["max_depth"], depth)
             while True:     # node loop (repeats after a failed literal)
@@ -483,6 +498,7 @@ class BranchSolver:
                 self.st["t_reduce"] += time.time() - t
                 if st:
                     self.st["pruned"][out] += 1
+                    self._cube(out)
                     break
                 lits = out
                 res, d, ixs, tc, sc = self._measure(lits)
@@ -490,12 +506,15 @@ class BranchSolver:
                     if not counting:
                         return self._finish(Result("SAT", "search", self.st))
                     total += 1 << self._nfree(lits)
+                    self._cube("empty")
                     break
                 if counting and self.xor is not None and all(self.is_xor[i] for i in self._keep):
                     total += self._xor_count(lits)
+                    self._cube("xor_count")
                     break
                 if sc <= self.sc_leaf and not force:
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
+                    self._cube("leaf")
                     if self.pool is not None:
                         self._submit_leaf(res, d, lits, tc)
                         break
@@ -519,6 +538,7 @@ class BranchSolver:
                 self.st["t_select"] += time.time() - t
                 if kind == "unsat":
                     self.st["pruned"][val if isinstance(val, str) else "prop"] += 1
+                    self._cube("failed")
                     break
                 if kind == "forced":
                     lits = val
@@ -526,14 +546,17 @@ class BranchSolver:
                 self.st["branches"] += 1
                 self.log(f"depth {depth}: tc 2^{tc:.1f} sc 2^{sc} -> branch "
                          f"(children tc {', '.join(f'2^{k[1]:.1f}' for k in val)})")
-                for l2, _, _ in reversed(val):    # cheaper child is explored first
-                    stack.append((l2, depth + 1, False, splits))
+                for l2, _, _, lit in reversed(val):    # cheaper child is explored first
+                    stack.append((l2, depth + 1, False, splits, dec + (lit,)))
                 break
         if counting:
             return self._finish(Result("COUNT", "search", self.st, count=total))
         return self._finish(Result("UNSAT", "search", self.st))
 
     def _finish(self, r):
+        if self.cubes is not None:
+            self.cubes.close()
+            self.cubes = None
         for fut, _, _, _, key in getattr(self, "pending", []):   # stopped early: keep leaves that did finish
             if key is not None and fut.done() and not fut.cancelled() and fut.exception() is None:
                 self._remember(key, fut.result())
