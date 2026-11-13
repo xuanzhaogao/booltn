@@ -897,20 +897,22 @@ def decide(clauses, tree, sliced=(), small_rc=14, early_exit=True, max_slices=No
     d = recompute_outputs(tree, [list(l) for l in slicer.labels], [])
     t = time.time()
     ct = CompiledTree(d, slicer.labels, use_graph=use_graph, small_rc=small_rc)
-    t_compile = time.time() - t
-    nsl = 1 << len(sliced)
-    todo = nsl if max_slices is None else min(nsl, max_slices)
-    ct.reset_flag()
-    t = time.time()
-    done = 0
-    for s in range(todo):
-        ct.set_leaves(slicer.words(s))
-        ct.run()
-        done += 1
-        if early_exit and s % 16 == 15 and ct.flag():
-            break
-    sat = bool(ct.flag())
-    lib().bt_sync()
-    info = dict(compile_s=t_compile, run_s=time.time() - t, arena_gib=ct.arena_bytes / 2 ** 30, nslices=nsl)
-    ct.free()
+    try:
+        t_compile = time.time() - t
+        nsl = 1 << len(sliced)
+        todo = nsl if max_slices is None else min(nsl, max_slices)
+        ct.reset_flag()
+        t = time.time()
+        done = 0
+        for s in range(todo):
+            ct.set_leaves(slicer.words(s))
+            ct.run()
+            done += 1
+            if early_exit and s % 16 == 15 and ct.flag():
+                break
+        sat = bool(ct.flag())
+        lib().bt_sync()
+        info = dict(compile_s=t_compile, run_s=time.time() - t, arena_gib=ct.arena_bytes / 2 ** 30, nslices=nsl)
+    finally:
+        ct.free()
     return sat, done, info

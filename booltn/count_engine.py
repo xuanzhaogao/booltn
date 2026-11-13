@@ -407,47 +407,49 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     d = recompute_outputs(tree, ixs, [])
     t0 = time.time()
     ct = CountTree(d, slicer.labels, small_rc=small_rc)
-    t_compile = time.time() - t0
-    # rigorous bound: count <= 2^(n_used) per... use 2^n_used (free vars handled exactly by a power of 2)
-    need_bits = len(used) + 1
-    if primes is None:
-        if mode == "rigorous":
-            primes, bits = [], 0.0
-            for p in moduli_desc():
-                if bits > need_bits:
+    try:
+        t_compile = time.time() - t0
+        # rigorous bound: count <= 2^(n_used) per... use 2^n_used (free vars handled exactly by a power of 2)
+        need_bits = len(used) + 1
+        if primes is None:
+            if mode == "rigorous":
+                primes, bits = [], 0.0
+                for p in moduli_desc():
+                    if bits > need_bits:
+                        break
+                    primes.append(p); bits += math.log2(p)
+                if bits <= need_bits:
+                    raise ValueError(f"need > {need_bits} bits but 8-bit primes give only {bits:.0f}")
+            else:
+                primes = moduli_desc()
+        nsl = 1 << len(sliced)
+        leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
+        residues, used_primes = [], []
+        t1 = time.time()
+        last, stable = None, 0
+        for p in primes:
+            ct.set_prime(p)
+            for s in range(nsl):
+                ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
+                ct.run()
+            residues.append(ct.residue()); used_primes.append(p)
+            if mode != "rigorous":
+                val, _ = crt(residues, used_primes)
+                stable = stable + 1 if val == last else 0
+                last = val
+                if stable >= confirm:
                     break
-                primes.append(p); bits += math.log2(p)
-            if bits <= need_bits:
-                raise ValueError(f"need > {need_bits} bits but 8-bit primes give only {bits:.0f}")
         else:
-            primes = moduli_desc()
-    nsl = 1 << len(sliced)
-    leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
-    residues, used_primes = [], []
-    t1 = time.time()
-    last, stable = None, 0
-    for p in primes:
-        ct.set_prime(p)
-        for s in range(nsl):
-            ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
-            ct.run()
-        residues.append(ct.residue()); used_primes.append(p)
-        if mode != "rigorous":
-            val, _ = crt(residues, used_primes)
-            stable = stable + 1 if val == last else 0
-            last = val
-            if stable >= confirm:
-                break
-    else:
-        if mode != "rigorous":
-            raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
-    primes = used_primes
-    t_run = time.time() - t1
-    count, M = crt(residues, primes)
-    count <<= free_vars
-    info = dict(primes=len(primes), slices=nsl, compile_s=t_compile, run_s=t_run, arena_gib=ct.arena_bytes / 2 ** 30,
-                nops=ct.nops, per_pass_s=t_run / len(primes))
-    ct.free()
+            if mode != "rigorous":
+                raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
+        primes = used_primes
+        t_run = time.time() - t1
+        count, M = crt(residues, primes)
+        count <<= free_vars
+        info = dict(primes=len(primes), slices=nsl, compile_s=t_compile, run_s=t_run, arena_gib=ct.arena_bytes / 2 ** 30,
+                    nops=ct.nops, per_pass_s=t_run / len(primes))
+    finally:
+        ct.free()
     return count, info
 
 
