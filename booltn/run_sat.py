@@ -37,6 +37,7 @@ def main():
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--concurrent", type=int, default=1, help="run this many slices concurrently (one plan+arena per stream)")
     ap.add_argument("--small-rc", type=int, default=14, help="max output rank for batched small contractions (0 = off)")
+    ap.add_argument("--gpus", default=None, help="spread the slices over GPUs: k or a list like 0,1,2")
     args = ap.parse_args()
 
     if args.cnf:
@@ -74,10 +75,21 @@ def main():
     print(f"order: opt {t_opt:.1f}s; per slice tc=2^{tc:.2f} sc=2^{sc:.0f} ops/slice=2^{math.log2(ops_slice):.2f}; "
           f"{len(sliced)} sliced vars -> {2**len(sliced)} slices")
 
-    E.lib()
-    E.STATS.reset()
     nsl = 2 ** len(sliced)
     max_slices = args.max_slices or nsl
+    if args.gpus:
+        from .multigpu import GpuPool, parse_gpus, decide_sliced
+        with GpuPool(parse_gpus(args.gpus)) as pool:
+            res, done, info = decide_sliced(pool, clauses, d, sliced, small_rc=args.small_rc,
+                                            early_exit=not args.no_early_exit, max_slices=max_slices)
+        full = done == nsl or res
+        print(f"GPU result: {'SAT' if res else 'UNSAT'}" + ("" if full else f" (partial: {done}/{nsl} slices)") +
+              (f" [{'OK' if res == truth else 'MISMATCH'}]" if full and truth is not None else ""))
+        print(f"time {info['wall']:.3f}s for {done} slices on {len(info['per_gpu'])} GPU workers (incl. compile); "
+              f"bool-ops {ops_slice*done:.3e} -> {ops_slice*done/info['wall']/1e12:.1f} TOPS; per GPU (id, slices, s): {info['per_gpu']}")
+        return
+    E.lib()
+    E.STATS.reset()
     if not args.eager:
         run_plan(clauses, d, sliced, ops_slice, truth, max_slices, nsl, args)
         return

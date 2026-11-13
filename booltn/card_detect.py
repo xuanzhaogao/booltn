@@ -5,8 +5,8 @@ SAT 2014, syntactic variant):
   * k-subset rule: if for a literal set L (|L| = s) every w-subset of L is a clause, then
     "at least s-w+1 literals of L are true". With all-negative literals this is at-most-k
     (k = w-1); all-positive gives at-least-k.
-  * AMO rule (w = 2, negative binary clauses): greedy clique cover of the conflict graph;
-    each clique C (|C| >= 3) becomes sum(C) <= 1.
+  * AMO rule (w = 2): greedy clique cover of the literal conflict graph (binary clause l1 | l2 = edge
+    between -l1 and -l2); each clique C (|C| >= 3) of literals becomes sum(C) <= 1.
 Every clause not absorbed by a detected constraint is kept as `sum(literals) >= 1`.
 
   python -m booltn.card_detect in.cnf out.opb      # prints detection statistics
@@ -49,10 +49,11 @@ def detect(clauses, max_set=12):
                 if all(t in cset for t in covered):
                     used.update(covered)
                     cons.append((sorted(L), len(L) - w + 1))
-    # ---- AMO cliques over negative binary clauses ----
+    # ---- AMO cliques: a binary clause (l1 | l2) says the literals -l1, -l2 are not both true; nodes are
+    #      literals, so the rule is invariant under polarity flips ("shuffled-as" instances) ----
     nbr = collections.defaultdict(set)
     for c in cset:
-        if len(c) == 2 and all(l < 0 for l in c):
+        if len(c) == 2:
             a, b = sorted(-l for l in c)
             nbr[a].add(b); nbr[b].add(a)
     edges_left = {frozenset((a, b)) for a in nbr for b in nbr[a]}
@@ -72,7 +73,7 @@ def detect(clauses, max_set=12):
                 e = frozenset((a, b))
                 edges_left.discard(e)
                 used.add(frozenset((-a, -b)))
-            cons.append((sorted(-x for x in C), len(C) - 1))  # sum(not x) >= |C|-1  <=>  sum x <= 1
+            cons.append((sorted(-x for x in C), len(C) - 1))  # sum(not u) >= |C|-1  <=>  sum u <= 1 (u literals)
     rest = [sorted(c) for c in cset if c not in used]
     for c in rest:
         cons.append((c, 1))

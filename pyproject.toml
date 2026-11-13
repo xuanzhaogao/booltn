@@ -9,15 +9,18 @@ description = "Boolean tensor-network contraction (SAT and exact #SAT) on NVIDIA
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy"]
+# branch-and-reduce (booltn.branching): python-sat (CDCL, propagation), highspy (LP)
 
 [project.optional-dependencies]
 # contraction orders come from omeco (https://github.com/GiggleLiu/omeco, python bindings built with maturin);
 # python-sat gives the minisat ground truth in run_sat and the tests.
 sat = ["python-sat"]
+branch = ["python-sat", "highspy"]
 
 [project.scripts]
 booltn-sat = "booltn.run_sat:main"
 booltn-count = "booltn.run_count:main"
+booltn-branch = "booltn.run_branch:main"
 
 [tool.setuptools]
 packages = ["booltn"]

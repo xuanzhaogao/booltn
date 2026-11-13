@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--rigorous", action="store_true")
     ap.add_argument("--ntrials", type=int, default=8)
     ap.add_argument("--niters", type=int, default=30)
+    ap.add_argument("--gpus", default=None, help="spread the prime passes over GPUs: k or a list like 0,1,2")
     args = ap.parse_args()
     T0 = time.time()
     clauses, n = read_dimacs(args.cnf)
@@ -35,14 +36,21 @@ def main():
         save_tree(args.save_tree, d, sliced)
     dd, ixs_sl = prepare_tree(d, ixs, sliced)
     tc, sc = complexity(dd, ixs_sl)
-    cnt, info = CE.count_models(clauses, n, d, sliced=sliced, mode="rigorous" if args.rigorous else "stable")
+    if args.gpus:
+        from .multigpu import GpuPool, parse_gpus, count_sliced
+        with GpuPool(parse_gpus(args.gpus)) as pool:
+            cnt, minfo = count_sliced(pool, clauses, n, d, sliced, mode="rigorous" if args.rigorous else "stable")
+        info = dict(primes=minfo["primes"], compile_s=0.0, run_s=minfo["wall"], per_pass_s=minfo["wall"] / minfo["primes"],
+                    arena_gib=float("nan"), gpus=minfo["gpus"])
+    else:
+        cnt, info = CE.count_models(clauses, n, d, sliced=sliced, mode="rigorous" if args.rigorous else "stable")
     total = time.time() - T0
     l10 = math.log10(cnt) if cnt > 0 else float("-inf")
     print(json.dumps(dict(instance=os.path.basename(args.cnf), vars=n, clauses=len(clauses), tc=round(tc, 2), sc=sc,
                           slices=2 ** len(sliced), count=str(cnt), log10=round(l10, 4), primes=info["primes"],
                           opt_s=round(t_opt, 2), compile_s=round(info["compile_s"], 2), gpu_run_s=round(info["run_s"], 4),
                           per_pass_s=round(info["per_pass_s"], 5), arena_gib=round(info["arena_gib"], 3),
-                          total_wall_s=round(total, 2))))
+                          total_wall_s=round(total, 2), gpus=info.get("gpus", 1))))
 
 
 if __name__ == "__main__":

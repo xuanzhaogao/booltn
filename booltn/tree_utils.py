@@ -50,6 +50,26 @@ def recompute_outputs(d, ixs, iy):
     return rec(d)[0]
 
 
+def prune_tree(d, keep):
+    """Restrict a tree to the leaves `keep` (old tensor indices): other leaves are dropped (a node with one
+    surviving child is replaced by it) and kept leaves are renumbered by their position in `keep`.
+    Internal `eins` are stale afterwards: call recompute_outputs. Returns None if nothing is kept."""
+    pos = {t: i for i, t in enumerate(keep)}
+
+    def rec(t):
+        if "tensor_index" in t:
+            i = pos.get(t["tensor_index"])
+            return None if i is None else {"tensor_index": i}
+        a, b = rec(t["args"][0]), rec(t["args"][1])
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return {"args": [a, b], "eins": {}}
+
+    return rec(d)
+
+
 def contractions(d, ixs):
     """List of (B, M, N, K) label counts for every pairwise contraction (post-order)."""
     acc = []

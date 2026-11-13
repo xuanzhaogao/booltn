@@ -1,0 +1,434 @@
+"""Branch-and-reduce SAT solving with tensor-network leaves (TensorBranching for CNF).
+
+    from booltn.branching import BranchSolver
+    res = BranchSolver(clauses, n, sc_leaf=32).solve()
+    res.status          # "SAT" | "UNSAT" | "UNKNOWN";  res.stats: nodes, leaves, prunes per reducer, times
+    res = BranchSolver(clauses, n, mode="count").solve()
+    res.count           # exact model count (int); res.status "COUNT" (or "UNKNOWN" on a limit / error)
+
+Root: unit propagation, XOR Gauss-Jordan, LP over detected cardinality constraints and a CDCL probe with a
+large budget (booltn.reduce). Each can decide the instance. Otherwise one contraction tree is optimized
+for the reduced clause network (omeco TreeSA, or greedy for very large networks).
+
+Search (depth first). A node is a list of assumed literals:
+  1. reduce   propagation and XOR implications to a fixpoint; then the LP and a small-budget CDCL probe.
+              Any of them may prove the node UNSAT (prune) or find a model (SAT).
+  2. measure  the node's network = clauses not yet satisfied, restricted to their free literals; its tree
+              is the root tree with satisfied clauses pruned (no re-optimization), giving (tc, sc).
+  3. leaf     if sc <= sc_leaf: decide the network on the GPU (booltn.engine.decide).
+  4. branch   otherwise pick the variable with the best lookahead among the labels of the largest
+              intermediate tensors: both values are propagated (+XOR) and scored by the children's
+              tc and sc excess. A value whose propagation conflicts fixes the variable (failed literal)
+              instead of branching.
+Branching on a variable shrinks every tensor that carries it, as slicing does; unlike uniform slicing,
+each branch is reduced again and may be pruned, so the slices are non-uniform.
+
+Multi-GPU: with pool=GpuPool(...) the leaves are contracted asynchronously on all GPUs of the pool.
+
+Counting (mode="count") uses the same search with count-preserving steps only: implied literals are fixed
+(same value in every model), reducers may only prune (count 0), both children of a branch are summed,
+and a leaf contributes its tensor-network count (booltn.count_engine) times 2^(free variables). When every
+remaining clause belongs to a detected XOR, the node is counted in closed form, 2^(#XOR vars - rank)
+times 2^(other free variables), without contraction.
+"""
+import dataclasses
+import math
+import sys
+import time
+
+from .reduce import CDCL, XorSystem, LPRelaxation, detect_xors
+from .slicer import _big_labels
+from .tree_utils import recompute_outputs, complexity, prune_tree
+
+
+@dataclasses.dataclass
+class Result:
+    status: str                 # "SAT" | "UNSAT" | "UNKNOWN"
+    decided_by: str             # reducer or "gpu" / "cdcl-leaf" / "search"
+    stats: dict
+    model: list = None          # a satisfying assignment when a CDCL probe found one (DIMACS literals)
+    count: int = None           # mode="count": exact number of models
+
+
+def clean_clauses(clauses):
+    """Drop tautologies and duplicate literals / clauses. Returns (clauses, has_empty_clause)."""
+    out, seen, empty = [], set(), False
+    for c in clauses:
+        s = set(c)
+        if any(-l in s for l in s):
+            continue
+        if not s:
+            empty = True
+            continue
+        k = frozenset(s)
+        if k not in seen:
+            seen.add(k)
+            out.append(sorted(s, key=abs))
+    return out, empty
+
+
+def check_model(clauses, model):
+    true = set(l for l in model if l)
+    return all(any(l in true for l in c) for c in clauses)
+
+
+class BranchSolver:
+    def __init__(self, clauses, n, sc_leaf=32, use_xor=True, use_lp=True, cdcl_root=100000, cdcl_node=2000,
+                 lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
+                 leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
+                 verbose=0):
+        """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
+        continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
+        assert mode in ("decide", "count")
+        self.pool = pool
+        self.mode, self.count_mode = mode, count_mode
+        self.orig, self.empty = clean_clauses(clauses)
+        self.n = n
+        self.sc_leaf = sc_leaf
+        self.use_xor, self.use_lp = use_xor, use_lp
+        self.cdcl_root, self.cdcl_node = cdcl_root, cdcl_node
+        self.lp_max_depth = lp_max_depth
+        self.K = candidates
+        self.order, self.ntrials, self.niters, self.tree0 = order, ntrials, niters, tree
+        self.leaf = leaf
+        self.time_limit, self.max_nodes = time_limit, max_nodes
+        self.verbose = verbose
+        self.st = dict(nodes=0, leaves=0, branches=0, failed_literals=0, max_depth=0,
+                       pruned=dict(prop=0, xor=0, lp=0, cdcl=0), xor_closed=0, root_sc=None, root_tc=None,
+                       t_root=0.0, t_order=0.0, t_reduce=0.0, t_select=0.0, t_leaf=0.0, leaf_sc_max=0)
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 10 * len(self.orig) + 1000))
+
+    # ------------------------------------------------------------------------------------------
+    def log(self, *a):
+        if self.verbose:
+            print(f"[{time.time() - self.t0:8.2f}s]", *a, flush=True)
+
+    def _fixpoint(self, lits):
+        """Propagation + XOR implications. Returns (None, lits) or ("UNSAT", reason)."""
+        lits = list(lits)
+        while True:
+            ok, implied = self.cdcl.propagate(lits)
+            if not ok:
+                return "UNSAT", "prop"
+            lits = list(dict.fromkeys(list(lits) + list(implied)))
+            if self.xor is None:
+                return None, lits
+            ok, extra = self.xor.implied(lits)
+            if not ok:
+                return "UNSAT", "xor"
+            have = set(lits)
+            new = [l for l in extra if l not in have]
+            if not new:
+                return None, lits
+            lits += new
+
+    def _residual(self, lits):
+        """(kept clause indices, residual clauses) of the root clause list under lits."""
+        val = {}
+        for l in lits:
+            val[abs(l)] = l > 0
+        keep, res = [], []
+        for i, c in enumerate(self.clauses):
+            rem, sat = [], False
+            for l in c:
+                b = val.get(abs(l))
+                if b is None:
+                    rem.append(l)
+                elif b == (l > 0):
+                    sat = True
+                    break
+            if not sat:
+                keep.append(i)
+                res.append(rem)
+        return keep, res
+
+    def _measure(self, lits):
+        """Residual network, its tree (root tree pruned) and (tc, sc)."""
+        keep, res = self._residual(lits)
+        self._keep = keep
+        if not res:
+            return res, None, None, 0.0, 0
+        ixs = [[abs(l) - 1 for l in c] for c in res]
+        d = recompute_outputs(prune_tree(self.tree, keep), ixs, [])
+        tc, sc = complexity(d, ixs)
+        return res, d, ixs, tc, sc
+
+    # ------------------------------------------------------------------------------------------
+    def _unsat(self, why):
+        if self.mode == "count":
+            return Result("COUNT", why, self.st, count=0)
+        return Result("UNSAT", why, self.st)
+
+    def _root(self):
+        """Root reductions + ordering. Returns a Result if decided, else None."""
+        t = time.time()
+        if self.empty:
+            return self._unsat("empty-clause")
+        self.cdcl = CDCL(self.orig)
+        ok, implied = self.cdcl.propagate([])
+        if not ok:
+            return self._unsat("prop")
+        self.xor, self.xor_members = None, set()
+        if self.use_xor:
+            xs, self.xor_members = detect_xors(self.orig, members=True)
+            self.st["n_xor"] = len(xs)
+            if xs:
+                self.xor = XorSystem(xs)
+                if not self.xor.consistent:
+                    return self._unsat("xor")
+        st, lits = self._fixpoint(implied)
+        if st:
+            return self._unsat(lits)
+        self.lp = None
+        if self.use_lp:
+            self.lp = LPRelaxation(self.orig, self.n)
+            self.st["lp_rows"], self.st["lp_card"] = self.lp.n_rows, self.lp.n_card
+            if not self.lp.feasible(lits):
+                return self._unsat("lp")
+        if self.cdcl_root:
+            res, model = self.cdcl.probe(lits, self.cdcl_root)
+            if res is True and self.mode == "decide":
+                return Result("SAT", "cdcl", self.st, model)
+            if res is False:
+                return self._unsat("cdcl")
+        self.root_lits = lits
+        # root network: clauses not satisfied by the root literals, restricted to free literals
+        self.clauses = self.orig
+        keep, res = self._residual(lits)
+        self.clauses = res
+        self.is_xor = [frozenset(self.orig[j]) in self.xor_members for j in keep]
+        self.st["t_root"] = time.time() - t
+        self.log(f"root: {len(self.orig)} clauses -> {len(res)} after {len(lits)} root literals; "
+                 f"xor {self.st.get('n_xor', 0)}, lp rows {self.st.get('lp_rows', 0)}")
+        if not res:
+            if self.mode == "count":
+                return Result("COUNT", "prop", self.st, count=1 << self._nfree(lits))
+            return Result("SAT", "prop", self.st)
+        if self.mode == "count" and self.xor is not None and all(self.is_xor):
+            c = self._xor_count(lits)
+            if c is not None:
+                return Result("COUNT", "xor-closed-form", self.st, count=c)
+        # contraction tree of the root network
+        t = time.time()
+        ixs = [[abs(l) - 1 for l in c] for c in res]
+        if self.tree0 is not None:
+            self.tree = self.tree0
+        else:
+            import omeco
+            sizes = {l: 2 for ix in ixs for l in ix}
+            use_sa = self.order == "treesa" or (self.order == "auto" and len(ixs) <= 6000)
+            opt = (omeco.TreeSA(ntrials=self.ntrials, niters=self.niters,
+                                score=omeco.ScoreFunction(sc_target=self.sc_leaf, sc_weight=4.0))
+                   if use_sa else omeco.GreedyMethod())
+            self.tree = omeco.optimize_code(ixs, [], sizes, opt).to_dict()
+        self.tree = recompute_outputs(self.tree, ixs, [])
+        self.st["root_tc"], self.st["root_sc"] = complexity(self.tree, ixs)
+        self.st["t_order"] = time.time() - t
+        self.log(f"root tree: tc 2^{self.st['root_tc']:.1f} sc 2^{self.st['root_sc']} ({self.st['t_order']:.1f}s)")
+        return None
+
+    def _nfree(self, lits):
+        """Number of unassigned variables among 1..n."""
+        return self.n - len({abs(l) for l in lits})
+
+    def _xor_count(self, lits):
+        """Closed-form count when every remaining clause is an XOR clause: solutions of the XOR system
+        (with the assigned XOR variables as units) times 2^(unassigned variables outside the system)."""
+        ok, rk = self.xor.rank(lits)
+        if not ok:
+            return 0
+        assigned = {abs(l) - 1 for l in lits}
+        outside = self.n - len(self.xor.vars) - len(assigned - self.xor.vars)
+        self.st["xor_closed"] += 1
+        return 1 << (len(self.xor.vars) - rk + outside)
+
+    def _leaf_count(self, res, d, lits):
+        t = time.time()
+        self.st["leaves"] += 1
+        used = sorted({abs(l) for c in res for l in c})
+        if self.leaf == "gpu":
+            from .count_engine import count_models
+            c, _ = count_models(res, len(used), d, mode=self.count_mode)
+        else:   # "cdcl": enumerate models over the used variables (tests only)
+            from pysat.solvers import Minisat22
+            c = 0
+            with Minisat22(bootstrap_with=res) as s:
+                while s.solve():
+                    m = s.get_model()
+                    c += 1
+                    s.add_clause([-m[v - 1] for v in used])
+        self.st["t_leaf"] += time.time() - t
+        return c << (self._nfree(lits) - len(used))
+
+    def _submit_leaf(self, res, d, lits):
+        """Asynchronous leaf on the pool -> appended to self.pending as (future, shift)."""
+        from . import multigpu as MG
+        self.st["leaves"] += 1
+        if self.mode == "count":
+            used = sorted({abs(l) for c in res for l in c})
+            fut = self.pool.submit(MG._w_leaf_count, res, len(used), d, self.count_mode)
+            self.pending.append((fut, self._nfree(lits) - len(used)))
+        else:
+            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, d), 0))
+
+    def _drain(self, block=False, keep=0):
+        """Collect finished leaves (all if block, else until at most `keep` are pending).
+        Returns ("SAT", None) when a decide leaf is SAT, ("ERR", msg) on a leaf error, else (None, count)."""
+        t = time.time()
+        got, out = 0, None
+        while self.pending:
+            fut, shift = self.pending[0]
+            if not fut.done() and not block and len(self.pending) <= keep:
+                break
+            self.pending.pop(0)
+            try:
+                r = fut.result()
+            except ValueError as e:
+                out = ("ERR", str(e))
+                break
+            if self.mode == "count":
+                got += r << shift
+            elif r:
+                out = ("SAT", None)
+                break
+        self.st["t_leaf"] += time.time() - t
+        return out if out else (None, got)
+
+    def _leaf(self, res, d):
+        t = time.time()
+        self.st["leaves"] += 1
+        if self.leaf == "gpu":
+            from . import engine as E
+            sat = E.decide(res, d, [], early_exit=False)[0]
+        else:   # "cdcl": exact CDCL on the residual (for testing without an H100)
+            from pysat.solvers import Solver
+            with Solver(name="cadical195", bootstrap_with=res) as s:
+                sat = s.solve()
+        self.st["t_leaf"] += time.time() - t
+        return sat
+
+    def _select(self, lits):
+        """Best branching variable by lookahead -> ("branch", [(lits0, tc0), (lits1, tc1)])
+        or ("forced", lits') when a value fails, or ("unsat", reason) when both fail."""
+        res, d, ixs, tc, sc = self._measure(lits)
+        cands = _big_labels(d, ixs, self.sc_leaf)[: self.K]
+        best = None
+        for v in cands:
+            kids = []
+            for lit in (v + 1, -(v + 1)):
+                st, l2 = self._fixpoint(lits + [lit])
+                if st:
+                    self.st["failed_literals"] += 1
+                    st2, l3 = self._fixpoint(lits + [-lit])
+                    return ("unsat", l3) if st2 else ("forced", l3)
+                _, _, _, tc2, sc2 = self._measure(l2)
+                kids.append((l2, tc2, sc2))
+            score = math.log2(sum(2.0 ** (k[1] + max(0, k[2] - self.sc_leaf)) for k in kids))
+            if best is None or score < best[0]:
+                best = (score, v, kids)
+        return "branch", sorted(best[2], key=lambda k: k[1])
+
+    # ------------------------------------------------------------------------------------------
+    def solve(self):
+        self.t0 = time.time()
+        r = self._root()
+        if r is not None:
+            return self._finish(r)
+        stack = [(self.root_lits, 0)]
+        total = 0
+        counting = self.mode == "count"
+        self.pending = []
+        while stack:
+            if self.pool is not None and self.pending:
+                kind, val = self._drain(keep=2 * len(self.pool))
+                if kind == "SAT":
+                    return self._finish(Result("SAT", "gpu", self.st))
+                if kind == "ERR":
+                    self.st["error"] = val
+                    return self._finish(Result("UNKNOWN", "leaf-error", self.st))
+                total += val
+            if time.time() - self.t0 > self.time_limit or self.st["nodes"] >= self.max_nodes:
+                return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
+            lits, depth = stack.pop()
+            self.st["nodes"] += 1
+            self.st["max_depth"] = max(self.st["max_depth"], depth)
+            while True:     # node loop (repeats after a failed literal)
+                t = time.time()
+                st, out = self._fixpoint(lits)
+                if st is None and self.lp is not None and (self.lp_max_depth is None or depth <= self.lp_max_depth):
+                    if not self.lp.feasible(out):
+                        st, out = "UNSAT", "lp"
+                if st is None and self.cdcl_node and depth > 0:
+                    res, model = self.cdcl.probe(out, self.cdcl_node)
+                    if res is True and not counting:
+                        self.st["t_reduce"] += time.time() - t
+                        return self._finish(Result("SAT", "cdcl", self.st, model))
+                    if res is False:
+                        st, out = "UNSAT", "cdcl"
+                self.st["t_reduce"] += time.time() - t
+                if st:
+                    self.st["pruned"][out] += 1
+                    break
+                lits = out
+                res, d, ixs, tc, sc = self._measure(lits)
+                if not res:
+                    if not counting:
+                        return self._finish(Result("SAT", "search", self.st))
+                    total += 1 << self._nfree(lits)
+                    break
+                if counting and self.xor is not None and all(self.is_xor[i] for i in self._keep):
+                    total += self._xor_count(lits)
+                    break
+                if sc <= self.sc_leaf:
+                    self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
+                    if self.pool is not None:
+                        self._submit_leaf(res, d, lits)
+                        break
+                    if counting:
+                        try:
+                            total += self._leaf_count(res, d, lits)
+                        except ValueError as e:      # 8-bit primes exhausted (count too large)
+                            self.st["error"] = str(e)
+                            return self._finish(Result("UNKNOWN", "leaf-error", self.st))
+                        break
+                    if self._leaf(res, d):
+                        return self._finish(Result("SAT", self.leaf, self.st))
+                    break
+                t = time.time()
+                kind, val = self._select(lits)
+                self.st["t_select"] += time.time() - t
+                if kind == "unsat":
+                    self.st["pruned"][val if isinstance(val, str) else "prop"] += 1
+                    break
+                if kind == "forced":
+                    lits = val
+                    continue
+                self.st["branches"] += 1
+                self.log(f"depth {depth}: tc 2^{tc:.1f} sc 2^{sc} -> branch "
+                         f"(children tc {', '.join(f'2^{k[1]:.1f}' for k in val)})")
+                for l2, _, _ in reversed(val):    # cheaper child is explored first
+                    stack.append((l2, depth + 1))
+                break
+        if self.pool is not None and self.pending:
+            kind, val = self._drain(block=True)
+            if kind == "SAT":
+                return self._finish(Result("SAT", "gpu", self.st))
+            if kind == "ERR":
+                self.st["error"] = val
+                return self._finish(Result("UNKNOWN", "leaf-error", self.st))
+            total += val
+        if counting:
+            return self._finish(Result("COUNT", "search", self.st, count=total))
+        return self._finish(Result("UNSAT", "search", self.st))
+
+    def _finish(self, r):
+        r.stats["time"] = time.time() - self.t0
+        if hasattr(self, "cdcl"):
+            r.stats["t_cdcl"] = self.cdcl.time
+        if getattr(self, "xor", None) is not None:
+            r.stats["t_xor"] = self.xor.time
+        if getattr(self, "lp", None) is not None:
+            r.stats["t_lp"] = self.lp.time + self.lp.setup_time
+        if r.model is not None:
+            assert check_model(self.orig, r.model), "CDCL model does not satisfy the formula"
+        return r
