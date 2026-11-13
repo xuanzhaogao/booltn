@@ -11,11 +11,14 @@ Every clause not absorbed by a detected constraint is kept as `sum(literals) >= 
 
   python -m booltn.card_detect in.cnf out.opb      # prints detection statistics
 """
-import sys, os, itertools, collections
+import sys, os, itertools, collections, math
 from .satgen import read_dimacs
 
 
-def detect(clauses, max_set=12):
+def detect(clauses, max_set=128, subset_budget=5000):
+    """max_set caps a detected literal set; growing a set of size s by one literal checks C(s, w-1) subsets,
+    which must stay <= subset_budget (w = 3: s <= 100; w = 4: 32; w = 5: 20). A fixed cap of 12 split the
+    at-most-2 constraints of tph8-10 (17-21 pigeons per hole) and left their LP feasible."""
     cset = set(frozenset(c) for c in clauses)
     used = set()
     cons = []  # (literal list, rhs): sum of literals >= rhs  (literal -v means (1 - x_v))
@@ -35,7 +38,7 @@ def detect(clauses, max_set=12):
             L = set(c)
             # grow L greedily with literals l such that all (w-1)-subsets of L plus l are clauses
             grown = True
-            while grown and len(L) < max_set:
+            while grown and len(L) < max_set and math.comb(len(L), w - 1) <= subset_budget:
                 grown = False
                 cand = collections.Counter(l for x in L for cc in lit_clauses[x] for l in cc if l not in L)
                 for l, _ in cand.most_common():
