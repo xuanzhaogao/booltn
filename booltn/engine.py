@@ -9,7 +9,7 @@ import numpy as np
 
 _LIB = None
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# built by `make -C booltn/kernels` into booltn/booltn/lib/; override with $BOOLTN_LIB_DIR
+# built by `make -C kernels` (repository root) into booltn/lib/; override with $BOOLTN_LIB_DIR
 LIB_DIR = os.environ.get("BOOLTN_LIB_DIR", os.path.join(_HERE, "lib"))
 LIBPATH = os.path.join(LIB_DIR, "libbooltn.so")
 
@@ -20,7 +20,7 @@ def lib():
     global _LIB
     if _LIB is None:
         if not os.path.exists(LIBPATH):
-            raise OSError(f"{LIBPATH} not found: build it with `make -C booltn/kernels` (CUDA 12.8, sm_90a)")
+            raise OSError(f"{LIBPATH} not found: build it with `make -C kernels` in the booltn repository (CUDA 12.8, sm_90a)")
         L = ctypes.CDLL(LIBPATH)
         L.bt_malloc.restype = ctypes.c_void_p
         L.bt_malloc.argtypes = [ctypes.c_size_t]

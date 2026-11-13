@@ -11,15 +11,17 @@ models exactly (#SAT) for CNF formulas of low treewidth.
 * Whole contraction trees are compiled once into a CUDA graph with a single memory arena. Each slice
   (an assignment of the sliced variables) is then one graph replay.
 
-Measured numbers and design notes: [`../docs/`](../docs). For better contraction orders, see the sibling
-package [`treesa_gpu`](../treesa_gpu). `booltn` does not depend on it; it reads the same tree files.
+Measured numbers, design notes and all benchmark scripts live in the research repository
+[booltn-gpu](https://github.com/xuanzhaogao/booltn-gpu) (`docs/`), which includes this package as a submodule. For better
+contraction orders, see the sibling package [treesa_gpu](https://github.com/xuanzhaogao/treesa_gpu). `booltn` does not depend on
+it; both use the same tree files.
 
 ## Install
 
 ```bash
 module load cuda/12.8.0                 # Hopper only: needs sm_90a (wgmma, TMA)
-make -C booltn/kernels                  # -> booltn/booltn/lib/libbooltn.so, libcount8.so
-pip install -e booltn                   # numpy; also python-sat (minisat check) and omeco (ordering)
+make -C kernels                         # -> booltn/lib/libbooltn.so, libcount8.so
+pip install -e .                        # numpy; also python-sat (minisat check) and omeco (ordering)
 ```
 
 omeco's Python bindings come from [omeco](https://github.com/GiggleLiu/omeco) (`maturin develop` in
@@ -82,7 +84,7 @@ CUDA sources (`kernels/`):
 ## Tests
 
 ```bash
-flock /tmp/booltn_gpu.lock booltn/tests/run_all.sh     # on an H100
+flock /tmp/booltn_gpu.lock tests/run_all.sh     # on an H100
 ```
 
 The suite covers:

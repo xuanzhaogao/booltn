@@ -1,0 +1,12 @@
+# build outputs
+booltn/lib/
+kernels/bgemm_test
+kernels/sass_*.txt
+*.so
+*.o
+*.cubin
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run every booltn test on the local GPU (H100: sm_90a). Needs the CUDA libraries (make -C booltn/kernels),
-# the booltn package installed (pip install -e booltn) and omeco + python-sat. Wrap in
+# Run every booltn test on the local GPU (H100: sm_90a). Needs the CUDA libraries (make -C kernels),
+# the booltn package installed (pip install -e .) and omeco + python-sat. Wrap in
 # `flock /tmp/booltn_gpu.lock` on a shared GPU.
 cd "$(dirname "$0")"
 fail=0

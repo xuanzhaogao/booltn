@@ -1,8 +1,8 @@
 # CUDA kernels of booltn (Hopper only: wgmma / TMA need sm_90a).
 #   module load cuda/12.8.0
-#   make -C booltn/kernels                 -> booltn/booltn/lib/libbooltn.so, libcount8.so
-#   make -C booltn/kernels bgemm_test      -> standalone 1-bit GEMM test/benchmark (./bgemm_test M N K B [check] [reps])
-#   make -C booltn/kernels inc             -> regenerate the wgmma inline-PTX wrappers (*.inc, checked in)
+#   make -C kernels                 -> booltn/lib/libbooltn.so, libcount8.so   (from the repository root)
+#   make -C kernels bgemm_test      -> standalone 1-bit GEMM test/benchmark (./bgemm_test M N K B [check] [reps])
+#   make -C kernels inc             -> regenerate the wgmma inline-PTX wrappers (*.inc, checked in)
 NVCC    ?= nvcc
 ARCH    ?= sm_90a
 NVFLAGS ?= -O3 -std=c++17 -arch=$(ARCH)

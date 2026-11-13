@@ -20,7 +20,7 @@ def lib():
     if _LIB is None:
         path = os.path.join(LIB_DIR, "libcount8.so")
         if not os.path.exists(path):
-            raise OSError(f"{path} not found: build it with `make -C booltn/kernels` (CUDA 12.8, sm_90a)")
+            raise OSError(f"{path} not found: build it with `make -C kernels` in the booltn repository (CUDA 12.8, sm_90a)")
         L = ctypes.CDLL(path)
         L.c8_malloc.restype = VP
         L.c8_malloc.argtypes = [ctypes.c_size_t]

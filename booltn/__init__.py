@@ -11,7 +11,7 @@ Modules (import what you need; nothing is loaded eagerly):
   card_detect    CNF -> OPB with detected cardinality constraints
   run_sat, run_count   command-line entry points (booltn-sat, booltn-count)
 
-The CUDA libraries (libbooltn.so, libcount8.so) are built with `make -C booltn/kernels` into
-booltn/booltn/lib/ (or point $BOOLTN_LIB_DIR at them).
+The CUDA libraries (libbooltn.so, libcount8.so) are built with `make -C kernels` (from the repository root)
+into booltn/lib/, or point $BOOLTN_LIB_DIR at them.
 """
 __version__ = "0.1.0"
