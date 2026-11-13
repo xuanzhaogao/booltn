@@ -77,6 +77,7 @@ booltn-sat --grid 24 --alpha 3 --seed 1 --tree trees/grid_L24_a3_s1_sc33.json --
 booltn-count --cnf f.cnf [--sc 32] [--tree t.json]  # exact model count, one JSON line
 booltn-branch --cnf f.cnf [--sc-leaf 32]            # branch-and-reduce: reductions + GPU leaves (decision)
 booltn-branch --cnf f.cnf --count --gpus 4          # exact #SAT by branch-and-reduce, leaves on 4 GPUs
+booltn-branch --cnf f.cnf --count --leaf-cache j.jsonl   # journal leaf counts; run again with the same file to resume
 booltn-sat --n 70 --seed 1 --tree t.json --gpus 4   # slices spread over 4 GPUs (also booltn-count --gpus)
 ```
 

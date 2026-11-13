@@ -31,9 +31,17 @@ Counting (mode="count") uses the same search with count-preserving steps only: i
 and a leaf contributes its tensor-network count (booltn.count_engine) times 2^(free variables). When every
 remaining clause belongs to a detected XOR, the node is counted in closed form, 2^(#XOR vars - rank)
 times 2^(other free variables), without contraction.
+
+Leaf cache (count mode, leaf_cache=path): every GPU leaf count is appended to a JSON-lines journal keyed by a
+hash of the leaf's residual formula (the count of a formula does not depend on the path that produced it). A
+run that stops (time limit, lost allocation) is resumed by running again with the same journal: the search
+replays its internal nodes and takes every leaf already in the journal from there.
 """
 import dataclasses
+import hashlib
+import json
 import math
+import os
 import sys
 import time
 
@@ -78,7 +86,7 @@ class BranchSolver:
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
                  cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, max_splits=16, mip_root_time=None,
-                 verbose=0):
+                 leaf_cache=None, verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
         continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
         assert mode in ("decide", "count")
@@ -105,6 +113,29 @@ class BranchSolver:
                        pruned=dict(prop=0, xor=0, lp=0, cdcl=0), xor_closed=0, root_sc=None, root_tc=None,
                        t_root=0.0, t_order=0.0, t_reduce=0.0, t_select=0.0, t_leaf=0.0, leaf_sc_max=0)
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 10 * len(self.orig) + 1000))
+        self.cache, self.cache_path = {}, leaf_cache   # residual-formula hash -> model count over its variables
+        if leaf_cache and mode == "count" and os.path.exists(leaf_cache):
+            for line in open(leaf_cache):
+                try:
+                    r = json.loads(line)
+                    self.cache[r["key"]] = int(r["count"])
+                except (ValueError, KeyError):      # a line cut short by a killed run
+                    pass
+        self.st["leaves_cached"], self.st["cache_size"] = 0, len(self.cache)
+
+    @staticmethod
+    def _key(res):
+        """Hash of a residual clause list, independent of clause and literal order."""
+        c = sorted(tuple(sorted(cl)) for cl in res)
+        return hashlib.sha256(repr(c).encode()).hexdigest()[:32]
+
+    def _remember(self, key, count):
+        if key is None or key in self.cache:
+            return
+        self.cache[key] = count
+        if self.cache_path:
+            with open(self.cache_path, "a") as f:     # one short line per leaf: an O_APPEND write
+                f.write(json.dumps(dict(key=key, count=str(count))) + "\n")
 
     # ------------------------------------------------------------------------------------------
     def log(self, *a):
@@ -278,6 +309,10 @@ class BranchSolver:
         t = time.time()
         self.st["leaves"] += 1
         used = sorted({abs(l) for c in res for l in c})
+        key = self._key(res) if self.cache_path else None
+        if key in self.cache:
+            self.st["leaves_cached"] += 1
+            return self.cache[key] << (self._nfree(lits) - len(used))
         if self.leaf == "gpu":
             from .count_engine import count_models
             c, _ = count_models(res, len(used), d, mode=self.count_mode, primes=self.count_moduli)
@@ -289,6 +324,7 @@ class BranchSolver:
                     m = s.get_model()
                     c += 1
                     s.add_clause([-m[v - 1] for v in used])
+        self._remember(key, c)
         self.st["t_leaf"] += time.time() - t
         return c << (self._nfree(lits) - len(used))
 
@@ -298,10 +334,19 @@ class BranchSolver:
         self.st["leaves"] += 1
         if self.mode == "count":
             used = sorted({abs(l) for c in res for l in c})
-            fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode, self.count_moduli)
-            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits)))
+            key = self._key(res) if self.cache_path else None
+            if key in self.cache:
+                import concurrent.futures as cf
+                fut = cf.Future()
+                fut.set_result(self.cache[key])
+                self.st["leaves_cached"] += 1
+            else:
+                fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode,
+                                       self.count_moduli)
+            self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits), key))
         else:
-            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits, (self._depth, self._splits)))
+            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits,
+                                 (self._depth, self._splits), None))
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
@@ -311,7 +356,7 @@ class BranchSolver:
         t = time.time()
         got, out = 0, None
         while self.pending:
-            fut, shift, lits, (depth, splits) = self.pending[0]
+            fut, shift, lits, (depth, splits), key = self.pending[0]
             if not fut.done() and not block and len(self.pending) <= keep:
                 break
             try:
@@ -329,6 +374,7 @@ class BranchSolver:
                 break
             self.pending.pop(0)
             if self.mode == "count":
+                self._remember(key, r)
                 got += r << shift
             elif r:
                 out = ("SAT", None)
@@ -477,6 +523,9 @@ class BranchSolver:
         return self._finish(Result("UNSAT", "search", self.st))
 
     def _finish(self, r):
+        for fut, _, _, _, key in getattr(self, "pending", []):   # stopped early: keep leaves that did finish
+            if key is not None and fut.done() and not fut.cancelled() and fut.exception() is None:
+                self._remember(key, fut.result())
         r.stats["time"] = time.time() - self.t0
         if hasattr(self, "cdcl"):
             r.stats["t_cdcl"] = self.cdcl.time

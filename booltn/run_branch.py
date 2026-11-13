@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--time-limit", type=float, default=3600)
     ap.add_argument("--count", action="store_true", help="exact model counting (#SAT) instead of decision")
     ap.add_argument("--gpus", default=None, help="leaves on several GPUs: k (first k visible) or a list like 0,1,2")
+    ap.add_argument("--leaf-cache", default=None, help="--count: JSON-lines journal of leaf counts; a run that stopped "
+                    "resumes from it when started again with the same file")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     t = time.time()
@@ -51,7 +53,7 @@ def main():
                          cdcl_node=a.cdcl_node, lp_max_depth=a.lp_max_depth, candidates=a.candidates, order=a.order,
                          tree=tree, leaf=a.leaf, time_limit=a.time_limit, mode="count" if a.count else "decide",
                          pool=pool, cms_root_time=a.cms_root_time, cms_node_confl=a.cms_node,
-                         mip_root_time=a.mip_root_time, verbose=a.verbose).solve()
+                         mip_root_time=a.mip_root_time, leaf_cache=a.leaf_cache, verbose=a.verbose).solve()
     finally:
         if pool is not None:
             pool.close()
