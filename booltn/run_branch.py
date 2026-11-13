@@ -24,6 +24,8 @@ def main():
     ap.add_argument("--cdcl-node", type=int, default=2000, help="conflict budget per node (0 = off)")
     ap.add_argument("--candidates", type=int, default=12, help="branching candidates evaluated by lookahead")
     ap.add_argument("--cms-root-time", type=float, default=60.0, help="CryptoMiniSat (Gauss) probe at the root, seconds (0 = off)")
+    ap.add_argument("--mip-root-time", type=float, default=None,
+                    help="HiGHS MIP probe over the LP rows at the root, seconds (0 = off; default 60 decide, 0 count)")
     ap.add_argument("--cms-node", type=int, default=2000, help="CryptoMiniSat probe per node, conflicts (0 = off)")
     ap.add_argument("--order", choices=["auto", "treesa", "greedy"], default="auto")
     ap.add_argument("--tree", default=None, help="contraction tree of the root network (JSON {tree})")
@@ -46,7 +48,8 @@ def main():
         r = BranchSolver(cl, n, sc_leaf=a.sc_leaf, use_xor=not a.no_xor, use_lp=not a.no_lp, cdcl_root=a.cdcl_root,
                          cdcl_node=a.cdcl_node, lp_max_depth=a.lp_max_depth, candidates=a.candidates, order=a.order,
                          tree=tree, leaf=a.leaf, time_limit=a.time_limit, mode="count" if a.count else "decide",
-                         pool=pool, cms_root_time=a.cms_root_time, cms_node_confl=a.cms_node, verbose=a.verbose).solve()
+                         pool=pool, cms_root_time=a.cms_root_time, cms_node_confl=a.cms_node,
+                         mip_root_time=a.mip_root_time, verbose=a.verbose).solve()
     finally:
         if pool is not None:
             pool.close()

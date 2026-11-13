@@ -194,7 +194,15 @@ class GpuPool:
         return self.ex.submit(fn, *args)
 
     def close(self):
-        self.ex.shutdown(wait=True, cancel_futures=True)
+        """Stop the workers without waiting for running tasks (a search that ended on SAT, an error or the
+        time limit has no use for them; terminating frees their GPU memory)."""
+        procs = list(getattr(self.ex, "_processes", {}).values())
+        self.ex.shutdown(wait=False, cancel_futures=True)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=10)
 
     def __enter__(self):
         return self

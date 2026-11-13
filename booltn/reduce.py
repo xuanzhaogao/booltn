@@ -224,3 +224,31 @@ class LPRelaxation:
             h.changeColsBounds(len(idx), idx, np.zeros(len(idx)), np.ones(len(idx)))
         self.time += time.time() - t
         return st != self._status.kInfeasible
+
+    def mip(self, lits=(), time_limit=60.0):
+        """0/1 feasibility of the same rows (HiGHS MIP: branch and bound with cuts) under the literals.
+        Returns (True, model) with a model as DIMACS literals, (False, None) if infeasible, (None, None)
+        if undecided within time_limit. (HiGHS's thread pool is process-global: its size cannot be changed once
+        the LP has run, so no `threads` option here.)"""
+        import highspy
+        import numpy as np
+        t = time.time()
+        m = highspy.Highs()
+        m.setOptionValue("output_flag", False)
+        m.setOptionValue("time_limit", float(time_limit))
+        m.passModel(self.h.getModel())
+        n = self.n
+        m.changeColsIntegrality(n, np.arange(n, dtype=np.int32), np.array([highspy.HighsVarType.kInteger] * n))
+        idx = np.array([abs(l) - 1 for l in lits], dtype=np.int32)
+        if len(idx):
+            val = np.array([1.0 if l > 0 else 0.0 for l in lits])
+            m.changeColsBounds(len(idx), idx, val, val)
+        m.run()
+        st = m.getModelStatus()
+        self.time += time.time() - t
+        if st == self._status.kInfeasible:
+            return False, None
+        if st == self._status.kOptimal:
+            x = m.getSolution().col_value
+            return True, [(v + 1) if x[v] > 0.5 else -(v + 1) for v in range(n)]
+        return None, None

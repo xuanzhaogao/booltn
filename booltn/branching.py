@@ -77,12 +77,15 @@ class BranchSolver:
     def __init__(self, clauses, n, sc_leaf=32, use_xor=True, use_lp=True, cdcl_root=100000, cdcl_node=2000,
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
-                 cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, max_splits=16, verbose=0):
+                 cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, max_splits=16, mip_root_time=None,
+                 verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
         continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
         assert mode in ("decide", "count")
         self.pool = pool
         self.cms_root_time, self.cms_node_confl = cms_root_time, cms_node_confl
+        # HiGHS MIP over the LP rows at the root (decide: proves UNSAT or finds a model; count: only UNSAT helps)
+        self.mip_root_time = (60.0 if mode == "decide" else 0.0) if mip_root_time is None else mip_root_time
         self.count_moduli = count_moduli    # CRT moduli for GPU leaves (default: 8-bit moduli, then 16-bit primes)
         self.max_splits = max_splits        # leaf splits along one path when a leaf count fails (e.g. the 16-bit
                                             # plan, twice the memory, does not fit; each split lowers sc)
@@ -196,6 +199,16 @@ class BranchSolver:
                 return Result("SAT", "cdcl", self.st, model)
             if res is False:
                 return self._unsat("cdcl")
+        if self.lp is not None and self.mip_root_time:
+            tm = time.time()
+            res, model = self.lp.mip(lits, time_limit=self.mip_root_time)
+            self.st["t_mip"] = round(time.time() - tm, 3)
+            if res is False:
+                return self._unsat("mip")
+            if res is True and self.mode == "decide":
+                val = {abs(l): l > 0 for l in model}
+                if all(any(val.get(abs(l)) == (l > 0) for l in c) for c in self.orig):
+                    return Result("SAT", "mip", self.st, model)
         self.root_lits = lits
         # root network: clauses not satisfied by the root literals, restricted to free literals
         self.clauses = self.orig
@@ -278,23 +291,29 @@ class BranchSolver:
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
-        Returns ("SAT", None) when a decide leaf is SAT, ("ERR", msg) on a leaf error, else (None, count)."""
+        Returns ("SAT", None) when a decide leaf is SAT, ("ERR", msg) on a leaf error, ("LIMIT", None) when the
+        time limit passes while blocked on a leaf, else (None, count)."""
+        import concurrent.futures as cf
         t = time.time()
         got, out = 0, None
         while self.pending:
             fut, shift, lits, (depth, splits) = self.pending[0]
             if not fut.done() and not block and len(self.pending) <= keep:
                 break
-            self.pending.pop(0)
             try:
-                r = fut.result()
-            except ValueError as e:
+                r = fut.result(timeout=max(1.0, self.time_limit - (time.time() - self.t0)))
+            except cf.TimeoutError:
+                out = ("LIMIT", None)
+                break
+            except (ValueError, MemoryError) as e:    # count beyond the moduli, or the leaf plan does not fit
+                self.pending.pop(0)
                 if self.mode == "count" and splits < self.max_splits:   # leaf count failed: split this leaf
                     self.st["leaf_splits"] += 1
                     self._stack.append((lits, depth, True, splits + 1))
                     continue
-                out = ("ERR", str(e))
+                out = ("ERR", f"{type(e).__name__}: {e}")
                 break
+            self.pending.pop(0)
             if self.mode == "count":
                 got += r << shift
             elif r:
@@ -352,6 +371,8 @@ class BranchSolver:
         while stack or (self.pool is not None and self.pending):
             if not stack:              # only asynchronous leaves left: they may re-queue split nodes
                 kind, val = self._drain(block=True)
+                if kind == "LIMIT":
+                    return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
                 if kind == "SAT":
                     return self._finish(Result("SAT", "gpu", self.st))
                 if kind == "ERR":
@@ -361,6 +382,8 @@ class BranchSolver:
                 continue
             if self.pool is not None and self.pending:
                 kind, val = self._drain(keep=2 * len(self.pool))
+                if kind == "LIMIT":
+                    return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
                 if kind == "SAT":
                     return self._finish(Result("SAT", "gpu", self.st))
                 if kind == "ERR":
@@ -409,7 +432,7 @@ class BranchSolver:
                         try:
                             total += self._leaf_count(res, d, lits)
                             break
-                        except ValueError as e:      # count beyond the moduli / plan too large: split this leaf
+                        except (ValueError, MemoryError) as e:   # count beyond the moduli / plan too large: split
                             if splits >= self.max_splits:
                                 self.st["error"] = f"{e}; still too large after {splits} splits"
                                 return self._finish(Result("UNKNOWN", "leaf-error", self.st))
