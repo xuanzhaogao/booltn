@@ -4,6 +4,7 @@ Tensors are bit-packed: a tensor with labels [l0, l1, ..., l_{r-1}] has 2^r bits
 bit p of the linear index (l0 fastest). Every contraction is planned as
     permute(A), permute(B) -> batched bool GEMM (tensor-core or CUDA-core) -> C
 """
+import bisect
 import ctypes, os, time
 import numpy as np
 
@@ -349,29 +350,51 @@ def _setup_plan_api(L):
 
 
 class Arena:
-    """Offset allocator over one device buffer; tensors are assigned [offset, offset+bytes) intervals."""
+    """Offset allocator over one device buffer; tensors are assigned [offset, offset+bytes) intervals.
+    First fit by offset over the free gaps (the same placement as scanning the live blocks in offset order),
+    so an allocation costs O(#gaps), not O(#live blocks)."""
+    INF = 1 << 62
 
     def __init__(self):
-        self.live = []  # (offset, size, id)
+        self.gs, self.ge = [0], [self.INF]     # free gaps [gs[i], ge[i]), sorted, disjoint, non-adjacent
+        self.blocks = {}                       # id -> (offset, size)
         self.top = 0
         self.next_id = 0
 
+    @property
+    def live(self):
+        return sorted((o, s, t) for t, (o, s) in self.blocks.items())
+
     def alloc(self, nbytes):
         nbytes = (nbytes + 255) // 256 * 256
-        self.live.sort()
-        cur = 0
-        for off, sz, _ in self.live:
-            if off - cur >= nbytes:
+        for i, (s, e) in enumerate(zip(self.gs, self.ge)):
+            if e - s >= nbytes:
                 break
-            cur = max(cur, off + sz)
+        cur = s
+        if e - s == nbytes:
+            del self.gs[i], self.ge[i]
+        else:
+            self.gs[i] = s + nbytes
         tid = self.next_id
         self.next_id += 1
-        self.live.append((cur, nbytes, tid))
+        self.blocks[tid] = (cur, nbytes)
         self.top = max(self.top, cur + nbytes)
         return cur, tid
 
     def free(self, tid):
-        self.live = [x for x in self.live if x[2] != tid]
+        b = self.blocks.pop(tid, None)
+        if b is None:
+            return
+        s, e = b[0], b[0] + b[1]
+        i = bisect.bisect_left(self.gs, s)          # gaps before i start below s
+        if i < len(self.gs) and self.gs[i] == e:    # merge with the following gap
+            e = self.ge[i]
+            del self.gs[i], self.ge[i]
+        if i > 0 and self.ge[i - 1] == s:           # merge with the preceding gap
+            self.ge[i - 1] = e
+        else:
+            self.gs.insert(i, s)
+            self.ge.insert(i, e)
 
 
 class PlanTensor:
