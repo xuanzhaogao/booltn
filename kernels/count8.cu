@@ -800,9 +800,15 @@ int c8_make_streams(int n) {
   }
   return (int)g_streams.size();
 }
+// Large allocations (plan arenas) must leave 1.5 GiB free: kernels are loaded lazily on first launch and
+// graph instantiation allocates too, so an arena that fills the GPU fails later with "out of memory".
 void* c8_malloc(size_t bytes) {
   void* p = nullptr;
   bytes = (bytes + 255) & ~(size_t)255;
+  if (bytes > ((size_t)1 << 30)) {
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || bytes + ((size_t)3 << 29) > fr) return nullptr;
+  }
   if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
   return p;
 }

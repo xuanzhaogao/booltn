@@ -88,7 +88,8 @@ class BTensor:
     def to_bool(self):
         """Return numpy bool array with axis i <-> self.labels[i]."""
         buf = np.zeros(nwords(self.r), dtype=np.uint32)
-        lib().bt_d2h(buf.ctypes.data, self.ptr, buf.nbytes)
+        if lib().bt_d2h(buf.ctypes.data, self.ptr, buf.nbytes):
+            raise RuntimeError("booltn: CUDA error (see stderr)")
         bits = np.unpackbits(buf.view(np.uint8), bitorder="little")[: 1 << self.r].astype(bool)
         return np.transpose(bits.reshape((2,) * self.r), axes=list(range(self.r))[::-1]) if self.r else bits.reshape(())
 
@@ -783,7 +784,9 @@ class CompiledTree:
 
     def flag(self):
         buf = np.zeros(1, dtype=np.uint32)
-        self.L.bt_d2h_stream(buf.ctypes.data, self.base + self.flag_off, 4, self.stream)
+        # the copy synchronizes the stream: a failed kernel surfaces here (never read it as "no model")
+        if self.L.bt_d2h_stream(buf.ctypes.data, self.base + self.flag_off, 4, self.stream):
+            raise RuntimeError("booltn: CUDA error in the plan (see stderr)")
         return bool(buf[0])
 
     stream = -1  # -1 = default plan stream; >= 0 = extra stream index (see bt_make_streams)
@@ -804,7 +807,8 @@ class CompiledTree:
 
     def result(self):
         buf = np.zeros(1, dtype=np.uint32)
-        self.L.bt_d2h(buf.ctypes.data, self.base + self.root_off, 4)
+        if self.L.bt_d2h(buf.ctypes.data, self.base + self.root_off, 4):
+            raise RuntimeError("booltn: CUDA error in the plan (see stderr)")
         return bool(buf[0] & 1)
 
     def time_ops(self):

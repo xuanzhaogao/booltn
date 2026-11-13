@@ -369,7 +369,9 @@ class CountTree:
 
     def residue(self):
         v = np.zeros(1, dtype=np.int32)
-        self.L.c8_d2h(v.ctypes.data, self.base + self.acc_off, 4, self.stream)
+        # the copy synchronizes the stream: an asynchronous kernel failure surfaces here (never read it as 0)
+        if self.L.c8_d2h(v.ctypes.data, self.base + self.acc_off, 4, self.stream):
+            raise RuntimeError("count8: CUDA error in the plan (see stderr)")
         return int(v[0])
 
     def free(self):
@@ -470,10 +472,14 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 arena = max(arena, ct.arena_bytes)
             t1 = time.time()
             ct.set_prime(p)
-            for s in range(nsl):
-                ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
-                ct.run()
-            residues.append(ct.residue()); used_primes.append(p)
+            try:
+                for s in range(nsl):
+                    ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
+                    ct.run()
+                r = ct.residue()
+            except RuntimeError as e:   # a CUDA failure in the plan (e.g. out of memory): treat as "does not fit"
+                raise MemoryError(f"GPU plan (width {ct.width}) failed: {e}") from e
+            residues.append(r); used_primes.append(p)
             t_run += time.time() - t1
             widths[w] = widths.get(w, 0) + 1
             if mode != "rigorous":
