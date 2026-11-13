@@ -232,14 +232,25 @@ class BranchSolver:
         if self.tree0 is not None:
             self.tree = self.tree0
         else:
-            import omeco
-            sizes = {l: 2 for ix in ixs for l in ix}
-            # TreeSA up to 25000 tensors (domino 32x32, 6788 clauses: 3.4 s, sc 33 vs greedy sc 54)
-            use_sa = self.order == "treesa" or (self.order == "auto" and len(ixs) <= 25000)
-            opt = (omeco.TreeSA(ntrials=self.ntrials, niters=self.niters,
-                                score=omeco.ScoreFunction(sc_target=self.sc_leaf, sc_weight=4.0))
-                   if use_sa else omeco.GreedyMethod())
-            self.tree = omeco.optimize_code(ixs, [], sizes, opt).to_dict()
+            cands = []
+            if self.order != "gpu":
+                import omeco
+                sizes = {l: 2 for ix in ixs for l in ix}
+                # TreeSA up to 25000 tensors (domino 32x32, 6788 clauses: 3.4 s, sc 33 vs greedy sc 54)
+                use_sa = self.order in ("treesa", "best") or (self.order == "auto" and len(ixs) <= 25000)
+                opt = (omeco.TreeSA(ntrials=self.ntrials, niters=self.niters,
+                                    score=omeco.ScoreFunction(sc_target=self.sc_leaf, sc_weight=4.0))
+                       if use_sa else omeco.GreedyMethod())
+                cands.append(omeco.optimize_code(ixs, [], sizes, opt).to_dict())
+            if self.order in ("gpu", "best"):
+                # GPU TreeSA (optional package treesa_gpu): on grid 3-SAT L30 its trees cost 10-1000x less
+                # (tc 2^63.6 vs omeco's 2^73.4 at sc target 34)
+                import treesa_gpu
+                g, _ = treesa_gpu.optimize(ixs, [], nchains=1024, niters=50, sc_target=self.sc_leaf, sc_weight=1.0,
+                                           mode="tc")
+                cands.append(g)
+            cands = [recompute_outputs(c, ixs, []) for c in cands]
+            self.tree = min(cands, key=lambda c: complexity(c, ixs))     # lowest (tc, sc)
         self.tree = recompute_outputs(self.tree, ixs, [])
         self.st["root_tc"], self.st["root_sc"] = complexity(self.tree, ixs)
         self.st["t_order"] = time.time() - t

@@ -27,7 +27,9 @@ def main():
     ap.add_argument("--mip-root-time", type=float, default=None,
                     help="HiGHS MIP probe over the LP rows at the root, seconds (0 = off; default 60 decide, 0 count)")
     ap.add_argument("--cms-node", type=int, default=2000, help="CryptoMiniSat probe per node, conflicts (0 = off)")
-    ap.add_argument("--order", choices=["auto", "treesa", "greedy"], default="auto")
+    ap.add_argument("--order", choices=["auto", "treesa", "greedy", "gpu", "best"], default="auto",
+                    help="root contraction order: omeco (auto/treesa/greedy), GPU TreeSA (gpu, needs treesa_gpu), "
+                         "or both, keeping the lower tc (best)")
     ap.add_argument("--tree", default=None, help="contraction tree of the root network (JSON {tree})")
     ap.add_argument("--leaf", choices=["gpu", "cdcl"], default="gpu")
     ap.add_argument("--time-limit", type=float, default=3600)
