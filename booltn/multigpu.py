@@ -36,6 +36,33 @@ def visible_gpus():
         return []
 
 
+def flatten_tree(tree):
+    """Pickle-safe, non-recursive form of an omeco tree dict: post-order list of ("L", tensor_index) and
+    ("N", left, right, iy) entries (children by list index). Deep trees overflow pickle's recursion limit."""
+    out, idx, stack = [], {}, [(tree, False)]
+    while stack:
+        d, done = stack.pop()
+        if "tensor_index" in d:
+            idx[id(d)] = len(out)
+            out.append(("L", d["tensor_index"]))
+        elif done:
+            idx[id(d)] = len(out)
+            out.append(("N", idx[id(d["args"][0])], idx[id(d["args"][1])], list(d.get("eins", {}).get("iy", []))))
+        else:
+            stack += [(d, True), (d["args"][1], False), (d["args"][0], False)]
+    return out
+
+
+def unflatten_tree(flat):
+    nodes = []
+    for e in flat:
+        if e[0] == "L":
+            nodes.append({"tensor_index": e[1]})
+        else:
+            nodes.append({"args": [nodes[e[1]], nodes[e[2]]], "eins": {"ixs": [], "iy": e[3]}})
+    return nodes[-1]
+
+
 # ------------------------------------------------------------------------------------------------
 # worker side
 # ------------------------------------------------------------------------------------------------
@@ -46,6 +73,8 @@ _PLAN = {}          # key -> (kind, compiled plan, slicer); one cached plan per 
 
 def _init(gpu_queue, stop):
     global _GPU, _STOP
+    import sys
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 200000))   # tree utilities recurse over deep trees
     _GPU = gpu_queue.get()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_GPU)
     _STOP = stop
@@ -64,7 +93,7 @@ def _sat_plan(key, clauses, tree, sliced, small_rc):
     if old is not None:
         old[1].free()
     slicer = E.SatSlicer(clauses, list(sliced))
-    d = recompute_outputs(tree, [list(l) for l in slicer.labels], [])
+    d = recompute_outputs(unflatten_tree(tree), [list(l) for l in slicer.labels], [])
     ct = E.CompiledTree(d, slicer.labels, use_graph=True, small_rc=small_rc)
     _PLAN["sat"] = (key, ct, slicer)
     return ct, slicer
@@ -100,7 +129,7 @@ def _w_count_primes(key, clauses, tree, sliced, primes, small_rc):
         if old is not None:
             old[1].free()
         slicer = CE.CountSlicer(clauses, list(sliced))
-        d = recompute_outputs(tree, [list(l) for l in slicer.labels], [])
+        d = recompute_outputs(unflatten_tree(tree), [list(l) for l in slicer.labels], [])
         ct = CE.CountTree(d, slicer.labels, small_rc=small_rc)
         _PLAN["count"] = (key, ct, slicer)
     nsl = 1 << len(sliced)
@@ -114,14 +143,14 @@ def _w_count_primes(key, clauses, tree, sliced, primes, small_rc):
     return out, _GPU, time.time() - t
 
 
-def _w_leaf_decide(res, d):
+def _w_leaf_decide(res, flat):
     from . import engine as E
-    return E.decide(res, d, [], early_exit=False)[0]
+    return E.decide(res, unflatten_tree(flat), [], early_exit=False)[0]
 
 
-def _w_leaf_count(res, nused, d, mode):
+def _w_leaf_count(res, nused, flat, mode, moduli=None):
     from .count_engine import count_models
-    return count_models(res, nused, d, mode=mode)[0]
+    return count_models(res, nused, unflatten_tree(flat), mode=mode, primes=moduli)[0]
 
 
 def parse_gpus(spec):
@@ -179,6 +208,7 @@ def decide_sliced(pool, clauses, tree, sliced, small_rc=14, early_exit=True, max
     nsl = 1 << len(sliced)
     todo = nsl if max_slices is None else min(nsl, max_slices)
     G = len(pool)
+    tree = flatten_tree(tree)
     key = _key("sat", clauses, tree, sliced, small_rc)
     pool.stop.clear()
     t = time.time()
@@ -197,6 +227,7 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
     sliced = list(sliced)
     used = sorted({abs(l) - 1 for c in clauses for l in c})
     G = len(pool)
+    tree = flatten_tree(tree)
     key = _key("count", clauses, tree, sliced, small_rc)
     allp = moduli_desc()
     if mode == "rigorous":

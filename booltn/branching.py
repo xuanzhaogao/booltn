@@ -269,10 +269,10 @@ class BranchSolver:
         self.st["leaves"] += 1
         if self.mode == "count":
             used = sorted({abs(l) for c in res for l in c})
-            fut = self.pool.submit(MG._w_leaf_count, res, len(used), d, self.count_mode)
+            fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode, self.count_moduli)
             self.pending.append((fut, self._nfree(lits) - len(used), lits, self._depth))
         else:
-            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, d), 0, lits, self._depth))
+            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits, self._depth))
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
