@@ -18,6 +18,8 @@ closed-form counts or other counters. Details and scripts: [booltn-gpu](https://
 | 81 published crafted SAT instances (sgen, chessboard, Tseitin, Urquhart, subset cardinality) | **80 solved in 0.7–16 s**, incl. instances no SAT-competition entrant solved; kissat 38, CaDiCaL 33, CryptoMiniSat 56 (900 s) |
 | #SAT on grid-structured instances that sharpSAT-TD and d4v2 could not finish in 30 min | **all counted in 1.3–25 s** (Tseitin, domino tilings, plaquette CSP, grid 3-SAT) |
 | #SAT where those CPU counters do finish | **5–700× faster**, identical counts (9/9) |
+| `booltn-branch`, 258 published crafted SAT instances (900 s) | **245 decided**; best single CPU solver (CryptoMiniSat + Gauss) 200, virtual best of six CPU methods 253; all answers agree |
+| `booltn-branch --count`, 176-instance #SAT benchmark (1800 s) | **170 counted**; sharpSAT-TD / d4v2 virtual best 137; counts up to 10^289; all 151 references agree |
 
 Limits:
 * The cost is set by the treewidth. Wide formulas, such as random 3-SAT with n ≥ 100 for #SAT, are
