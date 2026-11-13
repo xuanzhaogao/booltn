@@ -35,6 +35,18 @@ Limits:
   entry) on the int8 tensor cores. The exact count is rebuilt by CRT over several primes.
 * Whole contraction trees are compiled once into a CUDA graph with a single memory arena. Each slice
   (an assignment of the sliced variables) is then one graph replay.
+* **Branch-and-reduce** (`booltn-branch`, in the style of TensorBranching.jl). The algorithms that beat
+  a dense network on particular families act as reductions at every search node:
+  * unit propagation;
+  * XOR detection with Gauss–Jordan elimination;
+  * an LP over detected cardinality constraints (HiGHS);
+  * budgeted CDCL probes (CaDiCaL, then CryptoMiniSat with Gauss).
+
+  The search branches on the variables of the largest tensors and contracts each remaining network on
+  the GPU once it is small enough. With `--count` it counts models exactly. Only count-preserving
+  reductions are used there, and XOR-only nodes are counted in closed form, 2^(#vars − rank).
+* **Multi-GPU** (`--gpus k`): one worker process per GPU. Slices, #SAT prime passes and
+  branch-and-reduce leaves are distributed over the workers.
 
 For better contraction orders, see the sibling package [treesa_gpu](https://github.com/xuanzhaogao/treesa_gpu). `booltn` does not
 depend on it; both use the same tree files. The research repository [booltn-gpu](https://github.com/xuanzhaogao/booltn-gpu)
@@ -58,9 +70,12 @@ booltn-sat --cnf f.cnf --expect none --sc 36        # SAT / UNSAT of a DIMACS fi
 booltn-sat --n 60 --seed 3 --sc 32                  # random 3-SAT, answer checked against minisat
 booltn-sat --grid 24 --alpha 3 --seed 1 --tree trees/grid_L24_a3_s1_sc33.json --max-slices 8 --timing
 booltn-count --cnf f.cnf [--sc 32] [--tree t.json]  # exact model count, one JSON line
+booltn-branch --cnf f.cnf [--sc-leaf 32]            # branch-and-reduce: reductions + GPU leaves (decision)
+booltn-branch --cnf f.cnf --count --gpus 4          # exact #SAT by branch-and-reduce, leaves on 4 GPUs
+booltn-sat --n 70 --seed 1 --tree t.json --gpus 4   # slices spread over 4 GPUs (also booltn-count --gpus)
 ```
 
-`booltn-sat` and `booltn-count` are the same as `python -m booltn.run_sat` and `python -m booltn.run_count`.
+The three commands are the same as `python -m booltn.run_sat`, `run_count` and `run_branch`.
 `--timing` prints the time spent in each kernel kind and the heaviest contractions. `--save-tree` and
 `--tree` store and reuse contraction orders.
 
@@ -93,7 +108,10 @@ labels of `sat_einsum`. Tree files hold `{"tree": ..., "sliced": [...]}` (`order
 | `tree_utils` | Contraction shapes (B, M, N, K), tc/sc, GPU time models (`h100_time`, fitted on the H100) |
 | `satgen` | Random and grid k-SAT, DIMACS input/output, `sat_einsum` |
 | `hard_families` | Tseitin grids, mutilated chessboard, plaquette CSP, noisy Tseitin |
-| `card_detect` | CNF → OPB with syntactically detected cardinality constraints (`python -m booltn.card_detect in.cnf out.opb`) |
+| `card_detect` | CNF → OPB with syntactically detected cardinality constraints (`python -m booltn.card_detect in.cnf out.opb`); at-most-one cliques over literals |
+| `reduce` | Reductions for branch-and-reduce: `CDCL` (propagation, CaDiCaL and CryptoMiniSat probes), `detect_xors` + `XorSystem` (Gauss–Jordan over GF(2)), `LPRelaxation` (HiGHS) |
+| `branching` | `BranchSolver`: root reductions, lookahead branching on the largest tensors, GPU leaves; `mode="decide"` or `"count"` |
+| `multigpu` | `GpuPool` (one process per GPU), `decide_sliced`, `count_sliced`; branch-and-reduce leaves via `BranchSolver(pool=...)` |
 
 CUDA sources (`kernels/`):
 
@@ -118,3 +136,4 @@ The suite covers:
 * `test_wide.py`: clauses wider than one word.
 * `test_slices.py`: every slice against minisat with assumptions, for the eager path, the plan, and the CUDA graph.
 * `test_decide.py`: `decide` against minisat.
+* `test_branching.py`: branch-and-reduce against minisat, with GPU leaves and each root reducer.

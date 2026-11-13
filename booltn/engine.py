@@ -381,6 +381,121 @@ class PlanTensor:
         self.tid = tid
 
 
+def _align(segments, blocks):
+    """Common label order for an operand layout and a producer's output layout, or None.
+
+    segments: [(labels, fixed)] = the operand layout required by the consumer kernel, fastest group first
+              (fixed: the group's internal order is already decided, else free);
+    blocks:   [label sets or lists] = the producer's output groups, fastest first (internal orders free).
+    A common order exists iff sorting by (segment, block) is consistent with both: every block contiguous
+    and every fixed segment keeping its order."""
+    seg_of, pos = {}, {}
+    for si, (labs, fixed) in enumerate(segments):
+        for j, l in enumerate(labs):
+            seg_of[l] = si
+            pos[l] = j if fixed else 0
+    blk_of = {}
+    for bi, blk in enumerate(blocks):
+        for l in blk:
+            blk_of[l] = bi
+    if seg_of.keys() != blk_of.keys():
+        return None
+    seq = sorted(seg_of, key=lambda l: (seg_of[l], blk_of[l], pos[l], l))
+    prev = -1
+    for l in seq:
+        if blk_of[l] < prev:
+            return None
+        prev = blk_of[l]
+    for si, (labs, fixed) in enumerate(segments):
+        if fixed and [l for l in seq if seg_of[l] == si] != list(labs):
+            return None
+    return seq
+
+
+def plan_layouts(tree, out_labels, is_small_node, choose):
+    """Top-down layout planning for a compiled contraction tree (shared by CompiledTree and CountTree).
+
+    The kernels fix each contraction's layout up to the order inside the label groups: operands
+    A = K+M+B and B = K+N+B (or N+K+B for "N-first" kernels), output C = N+M+B (first label fastest).
+    Going down from the root, every node fixes its group orders so that a producer can emit exactly the
+    operand layout its consumer needs (no permute): small-batch producers always can (their kernel writes
+    any order), large producers when their N|M|B blocks align (_align), the larger producer first. A
+    producer that cannot be aligned still orders its groups like the consumer reads them, so the remaining
+    permute moves whole runs.
+
+    out_labels(d): output labels of node d (leaf, small subtree or large node); is_small_node(d): node is
+    contracted by the small-batch kernel; choose(Bt, Kt, Mt, Nt) -> (swap, kind, b_operand_is_n_first).
+    Returns (info, orders, smallwant): per large node its roles/kind/groups, its group orders
+    {"K","M","N","B"}, and the output order requested from each small producer."""
+    info, orders, smallwant = {}, {}, {}
+
+    def pre(d):
+        if "tensor_index" in d or is_small_node(d):
+            return
+        pre(d["args"][0]); pre(d["args"][1])
+        Bt, Kt, Mt, Nt, Ra, Rb = plan(out_labels(d["args"][0]), out_labels(d["args"][1]), d["eins"]["iy"])
+        swap, kind, nfirst = choose(Bt, Kt, Mt, Nt)
+        if swap:
+            Mt, Nt, Ra, Rb = Nt, Mt, Rb, Ra
+        ca, cb = (d["args"][1], d["args"][0]) if swap else (d["args"][0], d["args"][1])
+        info[id(d)] = dict(swap=swap, kind=kind, nfirst=nfirst, A=ca, B=cb, Ra=Ra, Rb=Rb,
+                           sets=dict(K=set(Kt), M=set(Mt), N=set(Nt), B=set(Bt)))
+
+    def blocks_of(c):
+        if "tensor_index" in c:
+            return [[l] for l in out_labels(c)]            # leaf: fixed order
+        if is_small_node(c):
+            return [set(out_labels(c))]                    # small-batch output: any order
+        s = info[id(c)]["sets"]
+        return [s["N"], s["M"], s["B"]]                    # large output: N | M | B
+
+    def assign(d, want, pref=None):
+        I = info[id(d)]
+        S = I["sets"]
+        fixed = {}
+        if want is not None:
+            nN, nM = len(S["N"]), len(S["M"])
+            fixed["N"], fixed["M"], fixed["B"] = want[:nN], want[nN:nN + nM], want[nN + nM:]
+        elif pref is not None:
+            rank = {l: i for i, l in enumerate(pref)}
+            for g in "NMB":
+                fixed[g] = sorted(S[g], key=lambda l: (rank.get(l, len(rank)), l))
+        kidwant = {}
+        sides = [("A", I["A"], I["Ra"]), ("B", I["B"], I["Rb"])]
+        sides.sort(key=lambda s: -len(out_labels(s[1])))
+        segs_of = {"A": ["K", "M", "B"], "B": ["N", "K", "B"] if I["nfirst"] else ["K", "N", "B"]}
+        for side, c, red in sides:
+            if red:
+                continue        # a reducing permute is needed anyway; it writes the operand layout directly
+            segs = segs_of[side]
+            segments = [(fixed[g], True) if g in fixed else (sorted(S[g]), False) for g in segs]
+            seq = _align(segments, blocks_of(c))
+            if seq is None:
+                continue
+            p0 = 0
+            for g, (labs, _) in zip(segs, segments):
+                fixed[g] = seq[p0:p0 + len(labs)]
+                p0 += len(labs)
+            kidwant[id(c)] = seq
+        for g in "KMNB":
+            fixed.setdefault(g, sorted(S[g]))
+        orders[id(d)] = fixed
+        for side, c, _ in sides:
+            if "tensor_index" in c:
+                continue
+            if is_small_node(c):
+                if id(c) in kidwant:
+                    smallwant[id(c)] = kidwant[id(c)]
+            else:
+                assign(c, kidwant.get(id(c)),
+                       None if id(c) in kidwant else sum((fixed[g] for g in segs_of[side]), []))
+
+    if "tensor_index" not in tree and not is_small_node(tree):
+        pre(tree)
+        assign(tree, None)
+    return info, orders, smallwant
+
+
 class CompiledTree:
     """Records the whole contraction of `tree` (omeco dict) with leaves of given label lists.
 
@@ -388,9 +503,16 @@ class CompiledTree:
     leaf if all leaves have rank <= 5)); ct.run(); ct.result() -> bool
     """
 
-    def __init__(self, tree, leaf_labels, use_graph=True, small_rc=14):
-        L = lib()
-        _setup_plan_api(L)
+    def __init__(self, tree, leaf_labels, use_graph=True, small_rc=14, layout="planned", dry_run=False):
+        """layout: "planned" chooses every intermediate's label order top-down so that producers emit
+        their output directly in the layout the consumer kernel needs (no permute), small-batch outputs are
+        written in the consumer's layout, and reductions are fused into one permute; "greedy" is the old
+        per-contraction choice. dry_run: plan only (no GPU), for analysis (self.ops, self.records)."""
+        assert layout in ("planned", "greedy")
+        L = None
+        if not dry_run:
+            L = lib()
+            _setup_plan_api(L)
         self.L = L
         self.use_graph = use_graph
         self.records = []  # per op: (kind, B, M, N, K, op_index_start, op_index_end)
@@ -477,6 +599,38 @@ class CompiledTree:
             self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), nops0, len(ops)))
             return C
 
+        def contract_planned(d, a, b):
+            I, O = info[id(d)], orders[id(d)]
+            A, B = (b, a) if I["swap"] else (a, b)
+            kind = I["kind"]
+            Kt, Mt, Nt, Bt = O["K"], O["M"], O["N"], O["B"]
+            nops0 = len(ops)
+            Ao = Kt + Mt + Bt
+            Bo = Nt + Kt + Bt if I["nfirst"] else Kt + Nt + Bt
+            Co = Nt + Mt + Bt
+            A2 = permute_spec(A, Ao, I["Ra"])      # identity when the producer was planned for this layout
+            B2 = permute_spec(B, Bo, I["Rb"])
+            if kind == "tcp":
+                kk = len(Kt)
+                dummy = [("pad", i) for i in range(7 - kk)]
+                A3 = talloc(Kt + dummy + Mt + Bt); B3 = talloc(Kt + dummy + Nt + Bt)
+                ops.append(("pad", A2.off, A3.off, len(Mt) + len(Bt), kk))
+                ops.append(("pad", B2.off, B3.off, len(Nt) + len(Bt), kk))
+                for t in (A2, B2):
+                    if t is not A and t is not B:
+                        tfree(t)
+                A2, B2 = A3, B3
+            C = talloc(Co)
+            if kind in ("tc", "tcp"):
+                ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt) if kind == "tc" else 7))
+            else:
+                ops.append(("cc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
+            for t in (A2, B2):
+                if t is not A and t is not B:
+                    tfree(t)
+            self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), nops0, len(ops)))
+            return C
+
         # ---- pass 1: small subtrees, executed level-by-level with batched launches (no permutes) ----
         small = {}   # id(node) -> PlanTensor
         levels = {}  # level -> list of op tuples
@@ -505,6 +659,16 @@ class CompiledTree:
         if small_rc > 0:
             mark(tree)
 
+        # ---- layout planning (top-down over the large contractions) ----
+        info, orders, smallwant = {}, {}, {}
+        if layout == "planned":
+            info, orders, smallwant = plan_layouts(
+                tree,
+                lambda d: leaves[d["tensor_index"]].labels if "tensor_index" in d else
+                (small[id(d)][0] if id(d) in small else d["eins"]["iy"]),
+                lambda d: id(d) in small,
+                lambda Bt, Kt, Mt, Nt: (lambda sk: (sk[0], sk[1], sk[1] == "cc"))(choose_kind(Bt, Kt, Mt, Nt)))
+
         def tensor_of(d):
             if "tensor_index" in d:
                 return leaves[d["tensor_index"]]
@@ -517,6 +681,7 @@ class CompiledTree:
             build_small(d["args"][0])
             build_small(d["args"][1])
             lc, lev = small[id(d)]
+            lc = smallwant.get(id(d), lc)       # written directly in the large consumer's operand layout
             A = tensor_of(d["args"][0]); Bt_ = tensor_of(d["args"][1])
             off, _ = arena.alloc(4 * nwords(len(lc)))
             C = PlanTensor(lc, off, None)
@@ -548,12 +713,16 @@ class CompiledTree:
                 return small[id(d)]
             a = rec(d["args"][0])
             b = rec(d["args"][1])
-            c = contract_spec(a, b, d["eins"]["iy"])
+            c = contract_planned(d, a, b) if id(d) in orders else contract_spec(a, b, d["eins"]["iy"])
             tfree(a)
             tfree(b)
             return c
 
         root = rec(tree)
+        self.ops, self.levels = ops, levels
+        if dry_run:
+            self.arena_bytes = arena.top
+            return
         self.arena_bytes = arena.top
         self.base = L.bt_malloc(self.arena_bytes)
         if not self.base:

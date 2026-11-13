@@ -193,12 +193,12 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
     """Exact model count; the prime passes are spread over the pool's GPUs (one prime per GPU per round).
     mode="stable": stop when the CRT value is unchanged for `confirm` extra primes; "rigorous": enough
     primes to exceed 2^(#used variables)."""
-    from .count_engine import primes_desc, crt
+    from .count_engine import moduli_desc, crt
     sliced = list(sliced)
     used = sorted({abs(l) - 1 for c in clauses for l in c})
     G = len(pool)
     key = _key("count", clauses, tree, sliced, small_rc)
-    allp = primes_desc()
+    allp = moduli_desc()
     if mode == "rigorous":
         need, bits, sel = len(used) + 1, 0.0, []
         for p in allp:
@@ -227,7 +227,7 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
             break
     else:
         if mode != "rigorous" and stable < confirm:
-            raise ValueError("8-bit primes exhausted before the CRT reconstruction stabilized")
+            raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
     count, _ = crt([residues[q] for q in used_p], used_p)
     count <<= n - len(used)
     return count, dict(primes=len(used_p), gpus=G, wall=time.time() - t)

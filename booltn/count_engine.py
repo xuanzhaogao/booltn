@@ -8,7 +8,7 @@ Layout conventions match engine.py: a tensor with labels [l0..l_{r-1}] has 2^r e
 """
 import ctypes, os, math, time
 import numpy as np
-from .engine import Arena, PlanTensor, plan as classify, LIB_DIR
+from .engine import Arena, PlanTensor, plan as classify, LIB_DIR, plan_layouts
 
 _LIB = None
 IntArr = lambda xs: (ctypes.c_int * max(1, len(xs)))(*xs)
@@ -58,6 +58,19 @@ def primes_desc(limit=251):
     return [p for p in range(limit, 1, -1) if sieve[p]]
 
 
+def moduli_desc(limit=256):
+    """Pairwise coprime CRT moduli for byte tensors: the largest power <= limit of every prime < limit
+    (256, 251, 243, ...). Their product is about 10^109.2, vs 10^100.8 for the primes alone; the kernels'
+    Barrett reduction and int32 accumulation bounds hold for any modulus <= 256."""
+    out = []
+    for p in primes_desc(limit - 1):
+        q = p
+        while q * p <= limit:
+            q *= p
+        out.append(q)
+    return sorted(out, reverse=True)
+
+
 def crt(residues, primes):
     x, M = 0, 1
     for r, p in zip(residues, primes):
@@ -71,7 +84,10 @@ def crt(residues, primes):
 class CountTree:
     """Compiled counting plan for one contraction tree (omeco dict) with leaf label lists (rank <= 5)."""
 
-    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5):
+    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned"):
+        """layout: "planned" (producers emit their consumer's operand layout where possible, see
+        engine.plan_layouts) or "greedy" (per-contraction choice)."""
+        assert layout in ("planned", "greedy")
         L = lib()
         self.L = L
         self.use_graph = use_graph
@@ -130,6 +146,26 @@ class CountTree:
         if small_rc > 0:
             mark(tree)
 
+        def choose(Bt, Kt, Mt, Nt):
+            swap = len(Mt) > len(Nt)
+            if swap:
+                Mt, Nt = Nt, Mt
+            if len(Kt) >= tc_min_k and len(Nt) >= 5 and len(Bt) <= 30:
+                kind = "tc"
+            elif len(Kt) <= 4 and len(Nt) >= 4:
+                kind = "cco"
+            else:
+                kind = "cc"
+            return swap, kind, kind == "cco"
+
+        info, orders, smallwant = {}, {}, {}
+        if layout == "planned":
+            info, orders, smallwant = plan_layouts(
+                tree,
+                lambda d: leaves[d["tensor_index"]].labels if "tensor_index" in d else
+                (small[id(d)][0] if id(d) in small else d["eins"]["iy"]),
+                lambda d: id(d) in small, choose)
+
         def tensor_of(d):
             return leaves[d["tensor_index"]] if "tensor_index" in d else small[id(d)]
 
@@ -138,6 +174,7 @@ class CountTree:
                 return
             build_small(d["args"][0]); build_small(d["args"][1])
             lc, lev = small[id(d)]
+            lc = smallwant.get(id(d), lc)       # written directly in the large consumer's operand layout
             A, B = tensor_of(d["args"][0]), tensor_of(d["args"][1])
             off, _ = arena.alloc(nbytes(len(lc)))
             pa = {l: i for i, l in enumerate(A.labels)}
@@ -204,13 +241,39 @@ class CountTree:
             self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), n0, len(ops)))
             return C
 
+        def contract_planned(d, a, b):
+            I, O = info[id(d)], orders[id(d)]
+            A, B = (b, a) if I["swap"] else (a, b)
+            kind = I["kind"]
+            Kt, Mt, Nt, Bt = O["K"], O["M"], O["N"], O["B"]
+            n0 = len(ops)
+            Ao, Bo, Co = Kt + Mt + Bt, (Nt + Kt + Bt) if kind == "cco" else (Kt + Nt + Bt), Nt + Mt + Bt
+            A2, B2 = permute_spec(A, Ao, I["Ra"]), permute_spec(B, Bo, I["Rb"])
+            C = talloc(Co)
+            if kind in ("tc", "cco"):
+                ops.append((kind, A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
+            else:
+                nout = 1 << (len(Bt) + len(Mt) + len(Nt))
+                scratch = None
+                if nout < (1 << 17) and len(Kt) > 8:
+                    scratch = talloc(["scratch"] * (len(Bt) + len(Mt) + len(Nt) + 2))  # 4 bytes per element
+                ops.append(("cc", A2.off, B2.off, C.off, scratch.off if scratch else None,
+                            len(Bt), len(Mt), len(Nt), len(Kt)))
+                if scratch:
+                    tfree(scratch)
+            for t in (A2, B2):
+                if t is not A and t is not B:
+                    tfree(t)
+            self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), n0, len(ops)))
+            return C
+
         def rec(d):
             if "tensor_index" in d:
                 return leaves[d["tensor_index"]]
             if id(d) in small:
                 return small[id(d)]
             a, b = rec(d["args"][0]), rec(d["args"][1])
-            c = contract_spec(a, b, d["eins"]["iy"])
+            c = contract_planned(d, a, b) if id(d) in orders else contract_spec(a, b, d["eins"]["iy"])
             tfree(a); tfree(b)
             return c
 
@@ -350,14 +413,14 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     if primes is None:
         if mode == "rigorous":
             primes, bits = [], 0.0
-            for p in primes_desc():
+            for p in moduli_desc():
                 if bits > need_bits:
                     break
                 primes.append(p); bits += math.log2(p)
             if bits <= need_bits:
                 raise ValueError(f"need > {need_bits} bits but 8-bit primes give only {bits:.0f}")
         else:
-            primes = primes_desc()
+            primes = moduli_desc()
     nsl = 1 << len(sliced)
     leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
     residues, used_primes = [], []
@@ -377,7 +440,7 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 break
     else:
         if mode != "rigorous":
-            raise ValueError("8-bit primes exhausted before the CRT reconstruction stabilized")
+            raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
     primes = used_primes
     t_run = time.time() - t1
     count, M = crt(residues, primes)

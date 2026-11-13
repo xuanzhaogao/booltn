@@ -30,5 +30,29 @@ for name, (cl, n), by in [("tseitin 10 (odd)", tseitin_grid(10, 1), "xor"), ("ch
     good = r.status == "UNSAT" and r.decided_by == by
     ok &= good
     print(f"{'PASS' if good else 'FAIL'} {name:26s} {r.status} by {r.decided_by} (expected {by})")
+# counting with leaves that overflow the CRT range: moduli 101..113 reconstruct counts up to ~10^4 (two moduli
+# plus three confirming ones), so larger leaf counts must be split further; the exact total must still come out
+import numpy as np
+
+
+def brute(cl, n):
+    X = ((np.arange(1 << n)[:, None] >> np.arange(n)[None, :]) & 1).astype(bool)
+    okm = np.ones(1 << n, dtype=bool)
+    for c in cl:
+        s = np.zeros(1 << n, dtype=bool)
+        for l in c:
+            s |= X[:, abs(l) - 1] if l > 0 else ~X[:, abs(l) - 1]
+        okm &= s
+    return int(okm.sum())
+
+
+for name, (cl, n) in [("random 3-SAT n=22 m=30", (random_ksat(22, 30, 3, 5), 22)), ("random 4-SAT n=22 m=60", (random_ksat(22, 60, 4, 6), 22))]:
+    want = brute(cl, n)
+    r = BranchSolver(cl, n, mode="count", sc_leaf=20, cdcl_root=0, cdcl_node=0, ntrials=1, niters=5,
+                     count_moduli=[101, 103, 107, 109, 113]).solve()
+    good = r.count == want and r.stats["leaf_splits"] > 0
+    ok &= good
+    print(f"{'PASS' if good else 'FAIL'} {name:26s} count {r.count} (brute force {want}), {r.stats['leaf_splits']} leaf splits, "
+          f"{r.stats['leaves']} leaves")
 print("ALL PASSED" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

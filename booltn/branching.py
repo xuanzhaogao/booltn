@@ -77,12 +77,13 @@ class BranchSolver:
     def __init__(self, clauses, n, sc_leaf=32, use_xor=True, use_lp=True, cdcl_root=100000, cdcl_node=2000,
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
-                 cms_root_time=60.0, cms_node_confl=2000, verbose=0):
+                 cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
         continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
         assert mode in ("decide", "count")
         self.pool = pool
         self.cms_root_time, self.cms_node_confl = cms_root_time, cms_node_confl
+        self.count_moduli = count_moduli    # CRT moduli for GPU leaves (default: count_engine.moduli_desc)
         self.mode, self.count_mode = mode, count_mode
         self.orig, self.empty = clean_clauses(clauses)
         self.n = n
@@ -244,13 +245,13 @@ class BranchSolver:
         self.st["xor_closed"] += 1
         return 1 << (len(self.xor.vars) - rk + outside)
 
-    def _leaf_count(self, res, d, lits):
+    def _leaf_count(self, res, d, lits, moduli=None):
         t = time.time()
         self.st["leaves"] += 1
         used = sorted({abs(l) for c in res for l in c})
         if self.leaf == "gpu":
             from .count_engine import count_models
-            c, _ = count_models(res, len(used), d, mode=self.count_mode)
+            c, _ = count_models(res, len(used), d, mode=self.count_mode, primes=self.count_moduli)
         else:   # "cdcl": enumerate models over the used variables (tests only)
             from pysat.solvers import Minisat22
             c = 0
@@ -269,9 +270,9 @@ class BranchSolver:
         if self.mode == "count":
             used = sorted({abs(l) for c in res for l in c})
             fut = self.pool.submit(MG._w_leaf_count, res, len(used), d, self.count_mode)
-            self.pending.append((fut, self._nfree(lits) - len(used)))
+            self.pending.append((fut, self._nfree(lits) - len(used), lits, self._depth))
         else:
-            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, d), 0))
+            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, d), 0, lits, self._depth))
 
     def _drain(self, block=False, keep=0):
         """Collect finished leaves (all if block, else until at most `keep` are pending).
@@ -279,13 +280,17 @@ class BranchSolver:
         t = time.time()
         got, out = 0, None
         while self.pending:
-            fut, shift = self.pending[0]
+            fut, shift, lits, depth = self.pending[0]
             if not fut.done() and not block and len(self.pending) <= keep:
                 break
             self.pending.pop(0)
             try:
                 r = fut.result()
             except ValueError as e:
+                if self.mode == "count":       # count too large for the CRT range: split this leaf
+                    self.st["leaf_splits"] += 1
+                    self._stack.append((lits, depth, True))
+                    continue
                 out = ("ERR", str(e))
                 break
             if self.mode == "count":
@@ -309,11 +314,12 @@ class BranchSolver:
         self.st["t_leaf"] += time.time() - t
         return sat
 
-    def _select(self, lits):
+    def _select(self, lits, force=False):
         """Best branching variable by lookahead -> ("branch", [(lits0, tc0), (lits1, tc1)])
-        or ("forced", lits') when a value fails, or ("unsat", reason) when both fail."""
+        or ("forced", lits') when a value fails, or ("unsat", reason) when both fail.
+        force: branch even if the network already fits sc_leaf (a leaf count overflowed the CRT range)."""
         res, d, ixs, tc, sc = self._measure(lits)
-        cands = _big_labels(d, ixs, self.sc_leaf)[: self.K]
+        cands = _big_labels(d, ixs, self.sc_leaf if not force else max(0, sc - 3))[: self.K]
         best = None
         for v in cands:
             kids = []
@@ -336,11 +342,21 @@ class BranchSolver:
         r = self._root()
         if r is not None:
             return self._finish(r)
-        stack = [(self.root_lits, 0)]
+        stack = self._stack = [(self.root_lits, 0, False)]     # (literals, depth, force a branch)
         total = 0
         counting = self.mode == "count"
         self.pending = []
-        while stack:
+        self.st["leaf_splits"] = 0
+        while stack or (self.pool is not None and self.pending):
+            if not stack:              # only asynchronous leaves left: they may re-queue split nodes
+                kind, val = self._drain(block=True)
+                if kind == "SAT":
+                    return self._finish(Result("SAT", "gpu", self.st))
+                if kind == "ERR":
+                    self.st["error"] = val
+                    return self._finish(Result("UNKNOWN", "leaf-error", self.st))
+                total += val
+                continue
             if self.pool is not None and self.pending:
                 kind, val = self._drain(keep=2 * len(self.pool))
                 if kind == "SAT":
@@ -351,7 +367,8 @@ class BranchSolver:
                 total += val
             if time.time() - self.t0 > self.time_limit or self.st["nodes"] >= self.max_nodes:
                 return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
-            lits, depth = stack.pop()
+            lits, depth, force = stack.pop()
+            self._depth = depth
             self.st["nodes"] += 1
             self.st["max_depth"] = max(self.st["max_depth"], depth)
             while True:     # node loop (repeats after a failed literal)
@@ -381,7 +398,7 @@ class BranchSolver:
                 if counting and self.xor is not None and all(self.is_xor[i] for i in self._keep):
                     total += self._xor_count(lits)
                     break
-                if sc <= self.sc_leaf:
+                if sc <= self.sc_leaf and not force:
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
                     if self.pool is not None:
                         self._submit_leaf(res, d, lits)
@@ -389,15 +406,16 @@ class BranchSolver:
                     if counting:
                         try:
                             total += self._leaf_count(res, d, lits)
-                        except ValueError as e:      # 8-bit primes exhausted (count too large)
-                            self.st["error"] = str(e)
-                            return self._finish(Result("UNKNOWN", "leaf-error", self.st))
+                            break
+                        except ValueError:           # count exceeds the CRT range: split this leaf
+                            self.st["leaf_splits"] += 1
+                            force = True
+                    else:
+                        if self._leaf(res, d):
+                            return self._finish(Result("SAT", self.leaf, self.st))
                         break
-                    if self._leaf(res, d):
-                        return self._finish(Result("SAT", self.leaf, self.st))
-                    break
                 t = time.time()
-                kind, val = self._select(lits)
+                kind, val = self._select(lits, force=force)
                 self.st["t_select"] += time.time() - t
                 if kind == "unsat":
                     self.st["pruned"][val if isinstance(val, str) else "prop"] += 1
@@ -409,16 +427,8 @@ class BranchSolver:
                 self.log(f"depth {depth}: tc 2^{tc:.1f} sc 2^{sc} -> branch "
                          f"(children tc {', '.join(f'2^{k[1]:.1f}' for k in val)})")
                 for l2, _, _ in reversed(val):    # cheaper child is explored first
-                    stack.append((l2, depth + 1))
+                    stack.append((l2, depth + 1, False))
                 break
-        if self.pool is not None and self.pending:
-            kind, val = self._drain(block=True)
-            if kind == "SAT":
-                return self._finish(Result("SAT", "gpu", self.st))
-            if kind == "ERR":
-                self.st["error"] = val
-                return self._finish(Result("UNKNOWN", "leaf-error", self.st))
-            total += val
         if counting:
             return self._finish(Result("COUNT", "search", self.st, count=total))
         return self._finish(Result("UNSAT", "search", self.st))
