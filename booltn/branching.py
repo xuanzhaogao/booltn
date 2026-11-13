@@ -234,7 +234,8 @@ class BranchSolver:
         else:
             import omeco
             sizes = {l: 2 for ix in ixs for l in ix}
-            use_sa = self.order == "treesa" or (self.order == "auto" and len(ixs) <= 6000)
+            # TreeSA up to 25000 tensors (domino 32x32, 6788 clauses: 3.4 s, sc 33 vs greedy sc 54)
+            use_sa = self.order == "treesa" or (self.order == "auto" and len(ixs) <= 25000)
             opt = (omeco.TreeSA(ntrials=self.ntrials, niters=self.niters,
                                 score=omeco.ScoreFunction(sc_target=self.sc_leaf, sc_weight=4.0))
                    if use_sa else omeco.GreedyMethod())
