@@ -199,7 +199,7 @@ class BranchSolver:
                 return Result("SAT", "cdcl", self.st, model)
             if res is False:
                 return self._unsat("cdcl")
-        if self.lp is not None and self.mip_root_time:
+        if self.lp is not None and self.mip_root_time and self.lp.n_card > 0:   # pure CNF rows: CDCL is stronger
             tm = time.time()
             res, model = self.lp.mip(lits, time_limit=self.mip_root_time)
             self.st["t_mip"] = round(time.time() - tm, 3)
