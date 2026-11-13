@@ -11,7 +11,8 @@ large budget (booltn.reduce). Each can decide the instance. Otherwise one contra
 for the reduced clause network (omeco TreeSA, or greedy for very large networks).
 
 Search (depth first). A node is a list of assumed literals:
-  1. reduce   propagation and XOR implications to a fixpoint; then the LP and a small-budget CDCL probe.
+  1. reduce   propagation and XOR implications to a fixpoint; then the LP and small-budget CDCL probes
+              (CaDiCaL, then CryptoMiniSat with Gauss-Jordan if CaDiCaL is undecided).
               Any of them may prove the node UNSAT (prune) or find a model (SAT).
   2. measure  the node's network = clauses not yet satisfied, restricted to their free literals; its tree
               is the root tree with satisfied clauses pruned (no re-optimization), giving (tc, sc).
@@ -76,11 +77,12 @@ class BranchSolver:
     def __init__(self, clauses, n, sc_leaf=32, use_xor=True, use_lp=True, cdcl_root=100000, cdcl_node=2000,
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
-                 verbose=0):
+                 cms_root_time=60.0, cms_node_confl=2000, verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
         continues (decide: the first SAT leaf ends the search; count: leaf counts are summed)."""
         assert mode in ("decide", "count")
         self.pool = pool
+        self.cms_root_time, self.cms_node_confl = cms_root_time, cms_node_confl
         self.mode, self.count_mode = mode, count_mode
         self.orig, self.empty = clean_clauses(clauses)
         self.n = n
@@ -164,7 +166,7 @@ class BranchSolver:
         t = time.time()
         if self.empty:
             return self._unsat("empty-clause")
-        self.cdcl = CDCL(self.orig)
+        self.cdcl = CDCL(self.orig, cms=bool(self.cms_root_time or self.cms_node_confl))
         ok, implied = self.cdcl.propagate([])
         if not ok:
             return self._unsat("prop")
@@ -186,7 +188,7 @@ class BranchSolver:
             if not self.lp.feasible(lits):
                 return self._unsat("lp")
         if self.cdcl_root:
-            res, model = self.cdcl.probe(lits, self.cdcl_root)
+            res, model = self.cdcl.probe(lits, self.cdcl_root, cms_time=self.cms_root_time)
             if res is True and self.mode == "decide":
                 return Result("SAT", "cdcl", self.st, model)
             if res is False:
@@ -359,7 +361,7 @@ class BranchSolver:
                     if not self.lp.feasible(out):
                         st, out = "UNSAT", "lp"
                 if st is None and self.cdcl_node and depth > 0:
-                    res, model = self.cdcl.probe(out, self.cdcl_node)
+                    res, model = self.cdcl.probe(out, self.cdcl_node, cms_confl=self.cms_node_confl)
                     if res is True and not counting:
                         self.st["t_reduce"] += time.time() - t
                         return self._finish(Result("SAT", "cdcl", self.st, model))

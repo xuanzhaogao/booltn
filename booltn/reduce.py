@@ -4,7 +4,9 @@ Every reducer sees the original CNF plus the literals assumed at a search node (
 either decides the node or returns implied literals:
 
   CDCL         unit propagation and budgeted CDCL on one incremental solver (pysat CaDiCaL), with the
-               node's literals as assumptions. Learned clauses are shared by all nodes.
+               node's literals as assumptions. Learned clauses are shared by all nodes. Optionally a
+               second probe with CryptoMiniSat (Gauss-Jordan on recovered XORs inside CDCL), which
+               solves XOR-heavy instances that plain CDCL and separate Gauss cannot.
   XorSystem    XOR constraints recovered from the CNF + Gauss-Jordan elimination over GF(2): detects
                parity conflicts (Tseitin, Urquhart) and implied units.
   LPRelaxation LP over the clauses plus syntactically detected cardinality constraints
@@ -24,10 +26,15 @@ import time
 class CDCL:
     """One incremental pysat solver for unit propagation and budgeted probes under assumptions."""
 
-    def __init__(self, clauses, name="cadical195"):
+    def __init__(self, clauses, name="cadical195", cms=False):
         from pysat.solvers import Solver
         self.s = Solver(name=name, bootstrap_with=clauses)
         self.time = 0.0
+        self.cms = None
+        if cms:
+            import pycryptosat
+            self.cms = pycryptosat.Solver(threads=1)
+            self.cms.add_clauses([c for c in clauses if c])
 
     def propagate(self, lits):
         """Unit propagation under `lits`. Returns (ok, implied literals incl. lits); ok=False on conflict."""
@@ -36,16 +43,28 @@ class CDCL:
         self.time += time.time() - t
         return ok, implied
 
-    def probe(self, lits, budget):
-        """Budgeted CDCL under `lits` -> (True, model) | (False, None) | (None, None)."""
+    def probe(self, lits, budget, cms_confl=None, cms_time=None):
+        """Budgeted CDCL under `lits` -> (True, model) | (False, None) | (None, None). If CaDiCaL is
+        undecided and a CryptoMiniSat probe is enabled, CMS gets `cms_confl` conflicts / `cms_time` s."""
         t = time.time()
         if budget is None:
             res = self.s.solve(assumptions=list(lits))
         else:
             self.s.conf_budget(int(budget))
             res = self.s.solve_limited(assumptions=list(lits))
+        model = self.s.get_model() if res else None
+        if res is None and self.cms is not None and (cms_confl or cms_time):
+            kw = {}
+            if cms_confl:
+                kw["confl_limit"] = int(cms_confl)
+            if cms_time:
+                kw["time_limit"] = float(cms_time)
+            sat, sol = self.cms.solve(assumptions=list(lits), **kw)
+            if sat is not None:
+                res = sat
+                model = [i if sol[i] else -i for i in range(1, len(sol)) if sol[i] is not None] if sat else None
         self.time += time.time() - t
-        return res, (self.s.get_model() if res else None)
+        return res, model
 
     def delete(self):
         self.s.delete()

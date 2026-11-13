@@ -19,9 +19,12 @@ def main():
     ap.add_argument("--no-xor", action="store_true")
     ap.add_argument("--no-lp", action="store_true")
     ap.add_argument("--lp-max-depth", type=int, default=None, help="run the LP only down to this depth")
-    ap.add_argument("--cdcl-root", type=int, default=100000, help="conflict budget at the root (0 = off)")
+    ap.add_argument("--cdcl-root", type=int, default=None, help="conflict budget at the root (0 = off; default 100000, "
+                    "2000 with --count where a probe can only prove UNSAT)")
     ap.add_argument("--cdcl-node", type=int, default=2000, help="conflict budget per node (0 = off)")
     ap.add_argument("--candidates", type=int, default=12, help="branching candidates evaluated by lookahead")
+    ap.add_argument("--cms-root-time", type=float, default=60.0, help="CryptoMiniSat (Gauss) probe at the root, seconds (0 = off)")
+    ap.add_argument("--cms-node", type=int, default=2000, help="CryptoMiniSat probe per node, conflicts (0 = off)")
     ap.add_argument("--order", choices=["auto", "treesa", "greedy"], default="auto")
     ap.add_argument("--tree", default=None, help="contraction tree of the root network (JSON {tree})")
     ap.add_argument("--leaf", choices=["gpu", "cdcl"], default="gpu")
@@ -37,11 +40,13 @@ def main():
     if a.gpus:
         from .multigpu import GpuPool, parse_gpus
         pool = GpuPool(parse_gpus(a.gpus))
+    if a.cdcl_root is None:
+        a.cdcl_root = 2000 if a.count else 100000
     try:
         r = BranchSolver(cl, n, sc_leaf=a.sc_leaf, use_xor=not a.no_xor, use_lp=not a.no_lp, cdcl_root=a.cdcl_root,
                          cdcl_node=a.cdcl_node, lp_max_depth=a.lp_max_depth, candidates=a.candidates, order=a.order,
                          tree=tree, leaf=a.leaf, time_limit=a.time_limit, mode="count" if a.count else "decide",
-                         pool=pool, verbose=a.verbose).solve()
+                         pool=pool, cms_root_time=a.cms_root_time, cms_node_confl=a.cms_node, verbose=a.verbose).solve()
     finally:
         if pool is not None:
             pool.close()
