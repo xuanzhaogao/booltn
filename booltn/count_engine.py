@@ -450,11 +450,30 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 raise ValueError(f"need > {need_bits} bits but the moduli give only {bits:.0f}")
         else:
             primes = allp
-    nsl = 1 << len(sliced)
-    leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
+    def build(w):
+        """Plan of width w with its slicer. A width-2 plan (twice the memory) that does not fit is sliced over
+        1..4 more labels (greedy_slice): the count is the same, so the 8-bit residues stay valid."""
+        from .slicer import greedy_slice
+        from .tree_utils import complexity
+        last_err = None
+        for k in range(0, 5 if w == 2 else 1):
+            sl, dd, extra = slicer, d, []
+            if k:
+                _, sc = complexity(d, ixs)
+                extra, _ = greedy_slice(d, ixs, sc - k, kind="tc")
+                sl = CountSlicer(clauses, sliced + extra)
+                dd = recompute_outputs(tree, [list(l) for l in sl.labels], [])
+            try:
+                return CountTree(dd, sl.labels, small_rc=small_rc, width=w), sl, len(extra)
+            except MemoryError as e:
+                last_err = e
+        if w == 1:
+            raise last_err
+        raise ValueError(f"16-bit plan does not fit even with 4 more sliced labels ({last_err})")
+
     residues, used_primes = [], []
     last, stable = None, 0
-    ct, t_compile, t_run, arena, widths = None, 0.0, 0.0, 0.0, {}
+    ct, t_compile, t_run, arena, widths, extra_sliced = None, 0.0, 0.0, 0.0, {}, 0
     try:
         for p in primes:
             w = width_of(p)
@@ -462,19 +481,16 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 if ct is not None:
                     ct.free(); ct = None
                 t0 = time.time()
-                try:
-                    ct = CountTree(d, slicer.labels, small_rc=small_rc, width=w)
-                except MemoryError as e:
-                    if w == 1:
-                        raise
-                    raise ValueError(f"16-bit plan does not fit ({e}); the 8-bit moduli (~10^109) did not suffice")
+                ct, slicer_w, extra_sliced = build(w)
+                nsl = 1 << (len(sliced) + extra_sliced)
+                leaf_bufs = [slicer_w.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
                 t_compile += time.time() - t0
                 arena = max(arena, ct.arena_bytes)
             t1 = time.time()
             ct.set_prime(p)
             try:
                 for s in range(nsl):
-                    ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
+                    ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer_w.leaves(s))
                     ct.run()
                 r = ct.residue()
             except RuntimeError as e:   # a CUDA failure in the plan (e.g. out of memory): treat as "does not fit"
@@ -497,7 +513,8 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
             ct.free()
     count, M = crt(residues, used_primes)
     count <<= free_vars
-    info = dict(primes=len(used_primes), primes16=widths.get(2, 0), slices=nsl, compile_s=t_compile, run_s=t_run,
+    info = dict(primes=len(used_primes), primes16=widths.get(2, 0), slices=1 << len(sliced),
+                extra_sliced16=extra_sliced if widths.get(2) else 0, compile_s=t_compile, run_s=t_run,
                 arena_gib=arena / 2 ** 30, per_pass_s=t_run / len(used_primes))
     return count, info
 

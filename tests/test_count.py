@@ -113,6 +113,27 @@ if __name__ == "__main__":
             allok &= check(f"16-bit domino {n}x{n} small_rc={src}", cl, nv, want, small_rc=src, primes=P16)
     allok &= check("16-bit random3sat n=20 sliced [0,1,2]", cl := random_ksat(20, 50, 3, 9), 20, brute(cl, 20),
                    sliced=[0, 1, 2], primes=P16)
+    # a 16-bit plan that does not fit is sliced over more labels; the 8-bit residues stay valid
+    import booltn.count_engine as CE
+    from booltn.count_engine import moduli_desc
+    orig_init = CE.CountTree.__init__
+    cl, nv = domino(10)
+    nlab = len({abs(l) for c in cl for l in c})
+
+    def tight(self, tree, leaf_labels, *a, width=1, **k):
+        if width == 2 and len({l for ls in leaf_labels for l in ls}) >= nlab:
+            raise MemoryError("test: unsliced 16-bit plan")
+        return orig_init(self, tree, leaf_labels, *a, width=width, **k)
+    CE.CountTree.__init__ = tight
+    try:
+        d = tree_for(cl, nv)
+        got, info = count_models(cl, nv, d, primes=moduli_desc()[:3] + primes16_desc()[:8])
+        ok = got == 258584046368 and info["extra_sliced16"] >= 1 and info["primes16"] >= 1
+        print(f"{'PASS' if ok else 'FAIL'} 16-bit plan sliced when it does not fit: got {got}, "
+              f"{info['extra_sliced16']} extra sliced labels, {info['primes16']} 16-bit moduli", flush=True)
+        allok &= ok
+    finally:
+        CE.CountTree.__init__ = orig_init
     # beyond the 8-bit CRT range (~10^109.2): the 54 8-bit moduli, then 16-bit primes
     cl, nv = hardcore_grid(66, 10)
     for src in (12, 0):
