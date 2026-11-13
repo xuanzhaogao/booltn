@@ -135,6 +135,14 @@ class CountTree:
         def tfree(t):
             if t.tid is not None:
                 arena.free(t.tid)
+                t.tid = None
+
+        def consumed(src, dst):
+            """src was permuted into dst: ops run in order on one stream, so src's bytes may be reused by any
+            later op (a tensor of the tree is read by exactly one contraction). Peak memory: 3 large tensors
+            (both operands' permuted copies and the output) instead of 5."""
+            if dst is not src:
+                tfree(src)
 
         def permute_spec(t, new_labels, red=()):
             if list(new_labels) == t.labels and not red:
@@ -222,9 +230,9 @@ class CountTree:
             n0 = len(ops)
             tmp = []
             if Ra:
-                A = permute_spec(A, [l for l in A.labels if l not in Ra], Ra); tmp.append(A)
+                A0, A = A, permute_spec(A, [l for l in A.labels if l not in Ra], Ra); tmp.append(A); consumed(A0, A)
             if Rb:
-                B = permute_spec(B, [l for l in B.labels if l not in Rb], Rb); tmp.append(B)
+                B0, B = B, permute_spec(B, [l for l in B.labels if l not in Rb], Rb); tmp.append(B); consumed(B0, B)
             if len(Mt) > len(Nt):
                 A, B, Mt, Nt = B, A, Nt, Mt
             # shared groups ordered by the larger operand (cheaper permutation of the big one)
@@ -238,7 +246,8 @@ class CountTree:
             else:
                 kind = "cc"
             Ao, Bo, Co = Kt + Mt + Bt, (Nt + Kt + Bt) if kind == "cco" else (Kt + Nt + Bt), Nt + Mt + Bt
-            A2, B2 = permute_spec(A, Ao), permute_spec(B, Bo)
+            A2 = permute_spec(A, Ao); consumed(A, A2)
+            B2 = permute_spec(B, Bo); consumed(B, B2)
             C = talloc(Co)
             if kind == "tc":
                 ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
@@ -269,7 +278,8 @@ class CountTree:
             Kt, Mt, Nt, Bt = O["K"], O["M"], O["N"], O["B"]
             n0 = len(ops)
             Ao, Bo, Co = Kt + Mt + Bt, (Nt + Kt + Bt) if kind == "cco" else (Kt + Nt + Bt), Nt + Mt + Bt
-            A2, B2 = permute_spec(A, Ao, I["Ra"]), permute_spec(B, Bo, I["Rb"])
+            A2 = permute_spec(A, Ao, I["Ra"]); consumed(A, A2)
+            B2 = permute_spec(B, Bo, I["Rb"]); consumed(B, B2)
             C = talloc(Co)
             if kind in ("tc", "cco"):
                 ops.append((kind, A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
@@ -474,6 +484,7 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     residues, used_primes = [], []
     last, stable = None, 0
     ct, t_compile, t_run, arena, widths, extra_sliced = None, 0.0, 0.0, 0.0, {}, 0
+    run_w, compile_w = {}, {}
     try:
         for p in primes:
             w = width_of(p)
@@ -485,6 +496,7 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 nsl = 1 << (len(sliced) + extra_sliced)
                 leaf_bufs = [slicer_w.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
                 t_compile += time.time() - t0
+                compile_w[w] = time.time() - t0
                 arena = max(arena, ct.arena_bytes)
             t1 = time.time()
             ct.set_prime(p)
@@ -497,6 +509,7 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 raise MemoryError(f"GPU plan (width {ct.width}) failed: {e}") from e
             residues.append(r); used_primes.append(p)
             t_run += time.time() - t1
+            run_w[w] = run_w.get(w, 0.0) + time.time() - t1
             widths[w] = widths.get(w, 0) + 1
             if mode != "rigorous":
                 val, _ = crt(residues, used_primes)
@@ -515,16 +528,17 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     count <<= free_vars
     info = dict(primes=len(used_primes), primes16=widths.get(2, 0), slices=1 << len(sliced),
                 extra_sliced16=extra_sliced if widths.get(2) else 0, compile_s=t_compile, run_s=t_run,
-                arena_gib=arena / 2 ** 30, per_pass_s=t_run / len(used_primes))
+                arena_gib=arena / 2 ** 30, per_pass_s=t_run / len(used_primes), run8_s=run_w.get(1, 0.0),
+                run16_s=run_w.get(2, 0.0), compile16_s=compile_w.get(2, 0.0))
     return count, info
 
 
-def profile_tree(clauses, n, tree, sliced=(), prime=251, small_rc=12):
+def profile_tree(clauses, n, tree, sliced=(), prime=251, small_rc=12, width=1):
     """Per-contraction GPU timing of one pass (one slice): returns list of (kind,B,M,N,K,ms)."""
     from .tree_utils import recompute_outputs
     slicer = CountSlicer(clauses, list(sliced))
     d = recompute_outputs(tree, [list(l) for l in slicer.labels], [])
-    ct = CountTree(d, slicer.labels, small_rc=small_rc, use_graph=False)
+    ct = CountTree(d, slicer.labels, small_rc=small_rc, use_graph=False, width=width)
     ct.set_prime(prime); ct.set_leaves(slicer.leaves(0)); ct.run(); ct.L.c8_sync_all()
     L = ct.L
     e0, e1 = L.c8_event_create(), L.c8_event_create()

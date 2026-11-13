@@ -382,7 +382,8 @@ class BranchSolver:
                 self._work_done += 2.0 ** tc
                 if info is not None:
                     self.log(f"leaf tc 2^{tc:.1f}: {info['s']:.0f} s on GPU {info['gpu']}, {info['primes']} passes "
-                             f"({info['primes16']} 16-bit, {info['extra_sliced16']} extra sliced labels); "
+                             f"({info['run8_s']:.0f} s 8-bit; {info['primes16']} 16-bit, {info['run16_s']:.0f} s, "
+                             f"{info['extra_sliced16']} extra sliced labels); "
                              f"leaves done {self.st['leaves'] - len(self.pending)}, journal {len(self.cache)}, "
                              f"leaf work 2^{math.log2(self._work_done):.2f} of root tc 2^{self.st['root_tc']:.2f}")
             elif r:

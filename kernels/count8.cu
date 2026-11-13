@@ -363,6 +363,8 @@ struct Tc8Params {
   long long c_plane;         // W = 2: offset of C's high-byte plane
   int tiles_m, tiles_n, group_m;
   const int* pp;
+  int seg = -1;  // W = 2: -1 = all four plane pairs in one launch; 0..3 = one pair per launch (see tc8_kernel)
+  int mul = 0;   //        per-pair launches: C <- mul * C + A_x B_y (mod p), C read from the previous launch
 };
 
 template <int BN, int NWG, int STAGES>
@@ -387,17 +389,22 @@ __device__ __forceinline__ void tc8_tile_coords(const Tc8Params& p, int tile, in
   tn = rr / gm;
 }
 
-// W = 2 (16-bit residues in byte planes A = A0 + 256 A1, B = B0 + 256 B1): every tile runs four K sweeps,
-// (A1,B1), (A0,B1), (A1,B0), (A0,B0), into the same accumulator, folded by Horner's rule after the first and
-// the third sweep: d <- 256 * (d mod p) (mod p). So d ends as A1B1*2^16 + (A0B1 + A1B0)*2^8 + A0B0 (mod p).
-template <int BN, int NWG, int STAGES, bool SMR, int MINB, int W>
+// W = 2 (16-bit residues in byte planes A = A0 + 256 A1, B = B0 + 256 B1): the four plane pairs (A1,B1),
+// (A0,B1), (A1,B0), (A0,B0) are combined by Horner's rule into A1B1*2^16 + (A0B1 + A1B0)*2^8 + A0B0 (mod p).
+// seg = -1: every tile runs the four K sweeps into one accumulator, folded d <- 256 * (d mod p) after the first
+//   and the third sweep (small K: C is written once).
+// seg = 0..3: one plane pair per launch, C <- mul * C + A_x B_y (mod p) in the epilogue (mul = 0, 256, 1, 256).
+//   Used for long K: with all four sweeps in one launch, concurrent tiles drift into different planes and stop
+//   sharing L2, and the GEMM ran at 4x-13x the 8-bit time (varying run to run); separate launches stay in step
+//   like the 8-bit GEMM (4.0-4.3x).
+template <int BN, int NWG, int STAGES, bool SMR, int MINB, int W, bool SPLIT = false>
 __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
     tc8_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CUtensorMap tmB1, Tc8Params p) {
   constexpr int BM = 64 * NWG;
   constexpr int A_BYTES = BM * 128, B_BYTES = BN * 128;
   constexpr int RED_EVERY = 128;  // stages between mod-p reductions: 128*128*255^2 + 2^16 < 2^31
-  constexpr int NSEG = W == 2 ? 4 : 1;
+  constexpr int NSEG = W == 2 && !SPLIT ? 4 : 1;  // SPLIT: one plane pair (p.seg) per launch
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   uint8_t* base = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
   Tc8Smem<BN, NWG, STAGES>& S = *reinterpret_cast<Tc8Smem<BN, NWG, STAGES>*>(base);
@@ -420,7 +427,8 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
         int b, tm, tn;
         tc8_tile_coords(p, tile, b, tm, tn);
         for (int j = 0; j < NSEG * KT; ++j, ++it) {
-          const int seg = W == 2 ? j / KT : 0, kt = j - seg * KT;
+          const int sj = NSEG > 1 ? j / KT : 0, kt = j - sj * KT;
+          const int seg = W == 2 ? (SPLIT ? p.seg : sj) : 0;
           const bool a1 = W == 2 && (seg == 0 || seg == 2), b1 = W == 2 && seg <= 1;
           int s = it % STAGES;
           mbar_wait(&S.empty[s], ((it / STAGES) & 1) ^ 1);
@@ -446,7 +454,7 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
       int since = 0;
       fence_operands(d);
       for (int j = 0; j < NSEG * KT; ++j, ++it) {
-        const int kt = W == 2 ? j % KT : j;
+        const int kt = NSEG > 1 ? j % KT : j;
         int s = it % STAGES;
         mbar_wait(&S.full[s], (it / STAGES) & 1);
         if (j == 0) {
@@ -469,7 +477,7 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
         wg_wait<1>();
         if (j > 0 && (threadIdx.x & 31) == 0) mbar_arrive(&S.empty[(it - 1) % STAGES]);
         ++since;
-        if (W == 2 && (j == KT - 1 || j == 3 * KT - 1)) {  // Horner fold between byte-plane sweeps
+        if (NSEG > 1 && (j == KT - 1 || j == 3 * KT - 1)) {  // Horner fold between byte-plane sweeps
           wg_wait<0>();
           fence_operands(d);
 #pragma unroll
@@ -499,9 +507,21 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
         for (int h = 0; h < 2; ++h) {
           const int row = r0 + 8 * h;
           if (row >= p.M) continue;
-          const uint32_t v0 = modp((uint32_t)d[4 * j + 2 * h], pr, mbar);
-          const uint32_t v1 = modp((uint32_t)d[4 * j + 2 * h + 1], pr, mbar);
+          uint32_t v0 = modp((uint32_t)d[4 * j + 2 * h], pr, mbar);
+          uint32_t v1 = modp((uint32_t)d[4 * j + 2 * h + 1], pr, mbar);
           uint8_t* dst = Cb + (long long)row * p.N + col;
+          if (W == 2 && SPLIT && p.seg > 0) {  // C <- mul * C + v (mod p), C from the previous plane-pair launch
+            uint32_t c0, c1 = 0;
+            if (col + 1 < p.N) {
+              const uint32_t lo = *reinterpret_cast<const uint16_t*>(dst), hi = *reinterpret_cast<const uint16_t*>(dst + p.c_plane);
+              c0 = (lo & 0xff) | ((hi & 0xff) << 8);
+              c1 = (lo >> 8) | (hi & 0xff00);
+            } else {
+              c0 = dst[0] | ((uint32_t)dst[p.c_plane] << 8);
+            }
+            v0 = modp(c0 * (uint32_t)p.mul + v0, pr, mbar);
+            v1 = modp(c1 * (uint32_t)p.mul + v1, pr, mbar);
+          }
           if (col + 1 < p.N) {
             *reinterpret_cast<uint16_t*>(dst) = (uint16_t)((v0 & 0xff) | ((v1 & 0xff) << 8));
             if constexpr (W == 2) *reinterpret_cast<uint16_t*>(dst + p.c_plane) = (uint16_t)((v0 >> 8) | (v1 & 0xff00));
@@ -589,10 +609,14 @@ static int make_map(CUtensorMap* m, const void* ptr, long long row_bytes, long l
 }
 
 typedef void (*Tc8KernelPtr)(CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, Tc8Params);
+// 16-bit tensor-core contractions with K >= 2^13 bytes run one launch per byte-plane pair (tc8_kernel): the
+// extra read and write of C per launch is < 1/2^12 of the work there
+constexpr int TC16_SPLIT_KK = 13;
 struct Tc8Launch {
   Tc8KernelPtr kern;
   CUtensorMap mA, mB, mA1, mB1;  // mA1, mB1: high-byte planes (W = 2)
   Tc8Params p;
+  bool split = false;            // W = 2, long K: four launches, one per byte-plane pair
   int grid, threads;
   size_t smem;
 };
@@ -620,19 +644,21 @@ static int prepare_tc8(Tc8Launch& L, const uint8_t* A, const uint8_t* B, uint8_t
   p.pp = pp;
   long long ntiles = (long long)p.tiles_m * p.tiles_n * p.batch;
   if (ntiles >= (1ll << 31)) return -2;
-  auto kern = tc8_kernel<BN, NWG, STAGES, SMR, MINB, W>;
+  L.split = W == 2 && kk >= TC16_SPLIT_KK;
+  auto kern = L.split ? tc8_kernel<BN, NWG, STAGES, SMR, MINB, W, true> : tc8_kernel<BN, NWG, STAGES, SMR, MINB, W, false>;
   L.kern = (Tc8KernelPtr)kern;
   L.smem = sizeof(Tc8Smem<BN, NWG, STAGES>) + 1024;
   L.threads = 128 * (NWG + 1);
-  static bool configured = false;
-  static int occ = 1;
-  if (!configured) {
+  static bool configured[2] = {false, false};
+  static int occ[2] = {1, 1};
+  const int ci = L.split ? 1 : 0;
+  if (!configured[ci]) {
     C8_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.smem));
-    C8_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, L.threads, L.smem));
-    if (occ < 1) occ = 1;
-    configured = true;
+    C8_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ[ci], kern, L.threads, L.smem));
+    if (occ[ci] < 1) occ[ci] = 1;
+    configured[ci] = true;
   }
-  L.grid = (int)std::min<long long>(ntiles, (long long)g_nsm * occ);
+  L.grid = (int)std::min<long long>(ntiles, (long long)g_nsm * occ[ci]);
   return 0;
 }
 
@@ -749,7 +775,18 @@ struct Op {
         }
         break;
       }
-      case 3: tc.kern<<<tc.grid, tc.threads, tc.smem, st>>>(tc.mA, tc.mB, tc.mA1, tc.mB1, tc.p); break;
+      case 3:
+        if (tc.split) {  // one launch per byte-plane pair (see tc8_kernel)
+          Tc8Params q = tc.p;
+          for (int sg = 0; sg < 4; ++sg) {
+            q.seg = sg;
+            q.mul = sg == 0 ? 0 : (sg == 2 ? 1 : 256);
+            tc.kern<<<tc.grid, tc.threads, tc.smem, st>>>(tc.mA, tc.mB, tc.mA1, tc.mB1, q);
+          }
+        } else {
+          tc.kern<<<tc.grid, tc.threads, tc.smem, st>>>(tc.mA, tc.mB, tc.mA1, tc.mB1, tc.p);
+        }
+        break;
       case 4:
         if (W == 1) small8_kernel<1><<<(int)grid, 256, 0, st>>>((const SmallOp8*)a, pp);
         else small8_kernel<2><<<(int)grid, 256, 0, st>>>((const SmallOp8*)a, pp);
@@ -929,6 +966,7 @@ int c8_plan_tc(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb, 
   Op& op = P->ops.back();
   op.kind = 3;
   op.W = P->W;
+  op.bb = bb; op.mm = mm; op.nn = nn; op.kk = kk;
   int bn = nn >= 8 ? 256 : (nn >= 7 ? 128 : 64);
   bool two = mm >= 7;
   int rc;
