@@ -22,7 +22,8 @@ closed-form counts or other counters. Details and scripts: [booltn-gpu](https://
 Limits:
 * The cost is set by the treewidth. Wide formulas, such as random 3-SAT with n ≥ 100 for #SAT, are
   easier for CPU solvers.
-* Counts are limited to about 10^110 (8-bit primes).
+* Counts above about 10^109 (the range of the 8-bit moduli) need 16-bit residues, which take twice the
+  memory and 2–4× the time per pass.
 * Each crafted SAT family has a CPU specialist that is faster: Gauss for parity, LP for the
   chessboard, cardinality detection for sgen.
 
@@ -31,8 +32,10 @@ Limits:
 * **Decision (SAT / UNSAT).** Each clause is a 0/1 tensor over its variables. Contracting the network
   in the OR-AND semiring gives the answer. Tensors are bit-packed (one bit per entry), and large
   contractions run on the 1-bit tensor cores.
-* **Counting (#SAT).** The same networks are contracted over integers mod p (p ≤ 251, one byte per
-  entry) on the int8 tensor cores. The exact count is rebuilt by CRT over several primes.
+* **Counting (#SAT).** The same networks are contracted over integers mod m (m ≤ 256, one byte per
+  entry) on the int8 tensor cores. The exact count is rebuilt by CRT over several moduli. Counts beyond
+  the 8-bit range (about 10^109) continue with 16-bit primes: each tensor holds two byte planes, and a
+  contraction runs four int8 GEMMs combined by Horner's rule in the accumulator.
 * Whole contraction trees are compiled once into a CUDA graph with a single memory arena. Each slice
   (an assignment of the sliced variables) is then one graph replay.
 * **Branch-and-reduce** (`booltn-branch`, in the style of TensorBranching.jl). The algorithms that beat
@@ -102,7 +105,7 @@ labels of `sat_einsum`. Tree files hold `{"tree": ..., "sliced": [...]}` (`order
 | module | content |
 |---|---|
 | `engine` | Bit-packed tensors (labels l0..l_{r-1}: l0 is the fastest bit). Kernel choice from a fitted cost model (`kernel_costs`, `choose_kind`). `CompiledTree` (plan, arena, CUDA graph), `SatSlicer` (leaf words for each slice), `decide` |
-| `count_engine` | `CountTree` and `CountSlicer` (int8 mod-p plan), `count_models` (CRT; `mode="stable"` or `"rigorous"`), `profile_tree` |
+| `count_engine` | `CountTree` (int8 mod-m plan; `width=2` for 16-bit residues) and `CountSlicer`, `count_models` (CRT over the 8-bit moduli, then 16-bit primes; `mode="stable"` or `"rigorous"`), `profile_tree` |
 | `ordering` | `optimize_order` (omeco TreeSA + TreeSASlicer), `prepare_tree`, `load_tree` / `save_tree` |
 | `slicer` | `greedy_slice`: slicing for a tree from any optimizer, with cost tc or modeled GPU time |
 | `tree_utils` | Contraction shapes (B, M, N, K), tc/sc, GPU time models (`h100_time`, fitted on the H100) |

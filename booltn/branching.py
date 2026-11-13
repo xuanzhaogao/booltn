@@ -83,8 +83,9 @@ class BranchSolver:
         assert mode in ("decide", "count")
         self.pool = pool
         self.cms_root_time, self.cms_node_confl = cms_root_time, cms_node_confl
-        self.count_moduli = count_moduli    # CRT moduli for GPU leaves (default: count_engine.moduli_desc)
-        self.max_splits = max_splits        # overflow splits along one path (each gains about one bit of range)
+        self.count_moduli = count_moduli    # CRT moduli for GPU leaves (default: 8-bit moduli, then 16-bit primes)
+        self.max_splits = max_splits        # leaf splits along one path when a leaf count fails (e.g. the 16-bit
+                                            # plan, twice the memory, does not fit; each split lowers sc)
         self.mode, self.count_mode = mode, count_mode
         self.orig, self.empty = clean_clauses(clauses)
         self.n = n
@@ -288,7 +289,7 @@ class BranchSolver:
             try:
                 r = fut.result()
             except ValueError as e:
-                if self.mode == "count" and splits < self.max_splits:   # count too large: split this leaf
+                if self.mode == "count" and splits < self.max_splits:   # leaf count failed: split this leaf
                     self.st["leaf_splits"] += 1
                     self._stack.append((lits, depth, True, splits + 1))
                     continue
@@ -408,7 +409,7 @@ class BranchSolver:
                         try:
                             total += self._leaf_count(res, d, lits)
                             break
-                        except ValueError as e:      # count exceeds the CRT range: split this leaf
+                        except ValueError as e:      # count beyond the moduli / plan too large: split this leaf
                             if splits >= self.max_splits:
                                 self.st["error"] = f"{e}; still too large after {splits} splits"
                                 return self._finish(Result("UNKNOWN", "leaf-error", self.st))

@@ -122,15 +122,17 @@ def _w_count_primes(key, clauses, tree, sliced, primes, small_rc):
     from . import count_engine as CE
     from .tree_utils import recompute_outputs
     t = time.time()
+    w = max(CE.width_of(p) for p in primes)   # 16-bit moduli need a width-2 plan
     old = _PLAN.get("count")
-    if old is not None and old[0] == key:
+    if old is not None and old[0] == key and old[1].width >= w:
         ct, slicer = old[1], old[2]
     else:
         if old is not None:
             old[1].free()
+            del _PLAN["count"]
         slicer = CE.CountSlicer(clauses, list(sliced))
         d = recompute_outputs(unflatten_tree(tree), [list(l) for l in slicer.labels], [])
-        ct = CE.CountTree(d, slicer.labels, small_rc=small_rc)
+        ct = CE.CountTree(d, slicer.labels, small_rc=small_rc, width=w)
         _PLAN["count"] = (key, ct, slicer)
     nsl = 1 << len(sliced)
     out = {}
@@ -223,13 +225,13 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
     """Exact model count; the prime passes are spread over the pool's GPUs (one prime per GPU per round).
     mode="stable": stop when the CRT value is unchanged for `confirm` extra primes; "rigorous": enough
     primes to exceed 2^(#used variables)."""
-    from .count_engine import moduli_desc, crt
+    from .count_engine import moduli_desc, primes16_desc, crt
     sliced = list(sliced)
     used = sorted({abs(l) - 1 for c in clauses for l in c})
     G = len(pool)
     tree = flatten_tree(tree)
     key = _key("count", clauses, tree, sliced, small_rc)
-    allp = moduli_desc()
+    allp = moduli_desc() + primes16_desc()      # 8-bit moduli, then 16-bit primes (width-2 plans)
     if mode == "rigorous":
         need, bits, sel = len(used) + 1, 0.0, []
         for p in allp:
@@ -237,7 +239,7 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
                 break
             sel.append(p); bits += math.log2(p)
         if bits <= need:
-            raise ValueError(f"need > {need} bits but 8-bit primes give only {bits:.0f}")
+            raise ValueError(f"need > {need} bits but the moduli give only {bits:.0f}")
         allp = sel
     t = time.time()
     residues, used_p, last, stable, i = {}, [], None, 0, 0
@@ -258,7 +260,7 @@ def count_sliced(pool, clauses, n, tree, sliced=(), small_rc=12, mode="stable", 
             break
     else:
         if mode != "rigorous" and stable < confirm:
-            raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
+            raise ValueError("moduli exhausted before the CRT reconstruction stabilized")
     count, _ = crt([residues[q] for q in used_p], used_p)
     count <<= n - len(used)
     return count, dict(primes=len(used_p), gpus=G, wall=time.time() - t)

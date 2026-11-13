@@ -1,8 +1,10 @@
 """Exact model counting (#SAT) by tensor-network contraction on the GPU (libcount8.so).
 
-Each pass computes the count modulo a prime p <= 251 (one byte per tensor entry, int8 tensor cores / dp4a);
-the exact count is rebuilt by CRT over enough primes. The compiled plan (CUDA graph) is shared by all primes:
-p lives in device memory and every kernel reads it.
+Each pass computes the count modulo a small modulus p; the exact count is rebuilt by CRT over enough moduli.
+Width 1: p <= 256, one byte per tensor entry (int8 tensor cores / dp4a); the 54 pairwise coprime moduli
+<= 256 reach about 10^109. Width 2: primes 256 < p < 2^16, 16-bit residues in two byte planes (four int8
+GEMMs per contraction), for counts beyond the 8-bit range. The compiled plan (CUDA graph) is shared by all
+moduli of one width: p lives in device memory and every kernel reads it.
 
 Layout conventions match engine.py: a tensor with labels [l0..l_{r-1}] has 2^r entries, l0 fastest.
 """
@@ -33,11 +35,14 @@ def lib():
         L.c8_event_elapsed.restype = ctypes.c_float
         L.c8_event_elapsed.argtypes = [VP, VP]
         L.c8_plan_new.restype = VP
+        L.c8_plan_new_w.restype = VP
+        L.c8_plan_new_w.argtypes = [ctypes.c_int]
         L.c8_plan_free.argtypes = [VP]
         L.c8_plan_permute.argtypes = [VP, VP, VP, ctypes.c_int, VP, VP, ctypes.c_int, VP]
         L.c8_plan_cc.argtypes = [VP, VP, VP, VP, VP] + [ctypes.c_int] * 4 + [VP]
         L.c8_plan_tc.argtypes = [VP, VP, VP, VP] + [ctypes.c_int] * 4 + [VP]
         L.c8_plan_small_batch.argtypes = [VP, ctypes.c_int, VP] + [VP] * 6 + [VP]
+        L.c8_plan_small_batch2.argtypes = [VP, ctypes.c_int, VP] + [VP] * 8 + [VP]
         L.c8_plan_add_accum.argtypes = [VP, VP, VP, VP]
         L.c8_plan_cco.argtypes = [VP, VP, VP, VP] + [ctypes.c_int] * 4 + [VP]
         L.c8_plan_run.argtypes = [VP, ctypes.c_int, ctypes.c_int]
@@ -71,6 +76,20 @@ def moduli_desc(limit=256):
     return sorted(out, reverse=True)
 
 
+def primes16_desc(lo=257, hi=65535):
+    """Primes in [lo, hi], largest first: 16-bit moduli (coprime to every 8-bit modulus)."""
+    sieve = np.ones(hi + 1, dtype=bool)
+    sieve[:2] = False
+    for i in range(2, int(hi ** 0.5) + 1):
+        if sieve[i]:
+            sieve[i * i::i] = False
+    return [int(p) for p in np.nonzero(sieve)[0][::-1] if p >= lo]
+
+
+def width_of(p):
+    return 1 if p <= 256 else 2
+
+
 def crt(residues, primes):
     x, M = 0, 1
     for r, p in zip(residues, primes):
@@ -84,10 +103,12 @@ def crt(residues, primes):
 class CountTree:
     """Compiled counting plan for one contraction tree (omeco dict) with leaf label lists (rank <= 5)."""
 
-    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned"):
+    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned", width=1):
         """layout: "planned" (producers emit their consumer's operand layout where possible, see
-        engine.plan_layouts) or "greedy" (per-contraction choice)."""
-        assert layout in ("planned", "greedy")
+        engine.plan_layouts) or "greedy" (per-contraction choice). width: 1 (moduli <= 256) or 2 (moduli
+        < 2^16; twice the memory, every tensor as a low-byte and a high-byte plane)."""
+        assert layout in ("planned", "greedy") and width in (1, 2)
+        self.width = width
         L = lib()
         self.L = L
         self.use_graph = use_graph
@@ -98,14 +119,14 @@ class CountTree:
         assert all(len(l) <= 5 for l in leaf_labels)
         p_off, _ = arena.alloc(4)
         acc_off, _ = arena.alloc(4)
-        leaf_off, _ = arena.alloc(32 * nleaf)
+        leaf_off, _ = arena.alloc(32 * width * nleaf)
         self.p_off, self.acc_off, self.leaf_off, self.nleaf = p_off, acc_off, leaf_off, nleaf
         self.leaf_ranks = [len(l) for l in leaf_labels]
-        leaves = [PlanTensor(l, leaf_off + 32 * i, None) for i, l in enumerate(leaf_labels)]
+        leaves = [PlanTensor(l, leaf_off + 32 * width * i, None) for i, l in enumerate(leaf_labels)]
         ops = []
 
         def nbytes(r):
-            return 1 << r
+            return width << r
 
         def talloc(labels):
             off, tid = arena.alloc(nbytes(len(labels)))
@@ -180,7 +201,7 @@ class CountTree:
             pa = {l: i for i, l in enumerate(A.labels)}
             pb = {l: i for i, l in enumerate(B.labels)}
             summed = [l for l in dict.fromkeys(A.labels + B.labels) if l not in set(lc)]
-            levels.setdefault(lev, []).append((A.off, B.off, off, len(lc), len(summed),
+            levels.setdefault(lev, []).append((A.off, B.off, off, len(lc), len(summed), len(A.labels), len(B.labels),
                                                [pa.get(l, -1) for l in lc], [pb.get(l, -1) for l in lc],
                                                [pa.get(l, -1) for l in summed], [pb.get(l, -1) for l in summed]))
             small[id(d)] = PlanTensor(lc, off, None)
@@ -278,6 +299,8 @@ class CountTree:
             return c
 
         root = rec(tree)
+        if root.r > 0:      # a lone leaf (a one-clause network): sum out its labels
+            root = permute_spec(root, [], root.labels)
         assert root.r == 0, f"root must be a scalar, got rank {root.r}"
         self.arena_bytes = arena.top
         self.base = L.c8_malloc(self.arena_bytes)
@@ -285,22 +308,22 @@ class CountTree:
             raise MemoryError(f"arena {self.arena_bytes/2**30:.2f} GiB")
         B = self.base
         pp = B + p_off
-        self.plan = L.c8_plan_new()
+        self.plan = L.c8_plan_new_w(width)
         nb = 0
         for lev in sorted(levels):
             lst = levels[lev]; n = len(lst)
             ptrs = (VP * (3 * n))()
-            rc = (ctypes.c_int * n)(); nk = (ctypes.c_int * n)()
+            rc = (ctypes.c_int * n)(); nk = (ctypes.c_int * n)(); ra = (ctypes.c_int * n)(); rb = (ctypes.c_int * n)()
             apos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n)); bpos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n))
             ka = (ctypes.c_int * (8 * n))(*([-1] * 8 * n)); kb = (ctypes.c_int * (8 * n))(*([-1] * 8 * n))
-            for i, (ao, bo, co, rci, nki, ap, bp, kai, kbi) in enumerate(lst):
+            for i, (ao, bo, co, rci, nki, rai, rbi, ap, bp, kai, kbi) in enumerate(lst):
                 ptrs[3 * i], ptrs[3 * i + 1], ptrs[3 * i + 2] = B + ao, B + bo, B + co
-                rc[i], nk[i] = rci, nki
+                rc[i], nk[i], ra[i], rb[i] = rci, nki, rai, rbi
                 for q, v in enumerate(ap): apos[24 * i + q] = v
                 for q, v in enumerate(bp): bpos[24 * i + q] = v
                 for q, v in enumerate(kai): ka[8 * i + q] = v
                 for q, v in enumerate(kbi): kb[8 * i + q] = v
-            r = L.c8_plan_small_batch(self.plan, n, ptrs, rc, nk, apos, bpos, ka, kb, pp)
+            r = L.c8_plan_small_batch2(self.plan, n, ptrs, rc, nk, apos, bpos, ka, kb, ra, rb, pp)
             if r:
                 raise RuntimeError(f"small batch failed {r}")
             nb += 1
@@ -325,13 +348,18 @@ class CountTree:
         self.nops = len(ops) + nb + 1
 
     def set_prime(self, p):
+        assert width_of(p) <= self.width and p < 65536, f"modulus {p} needs width {width_of(p)}"
         v = np.array([p], dtype=np.int32)
         self.L.c8_h2d(self.base + self.p_off, v.ctypes.data, 4, self.stream)
         self.L.c8_memset(self.base + self.acc_off, 0, 4, self.stream)
 
     def set_leaves(self, buf):
-        """buf: uint8 array of 32*nleaf bytes (leaf i at [32i, 32i + 2^rank_i))."""
-        self._buf = np.ascontiguousarray(buf, dtype=np.uint8)
+        """buf: uint8 array of 32*nleaf bytes (leaf i at [32i, 32i + 2^rank_i)); 0/1 entries, so with width 2
+        the high-byte plane [2^rank_i, 2^(rank_i+1)) of each 64-byte slot is zero."""
+        buf = np.ascontiguousarray(buf, dtype=np.uint8)
+        if self.width == 2:
+            buf = np.concatenate([buf.reshape(-1, 32), np.zeros((buf.size // 32, 32), dtype=np.uint8)], axis=1)
+        self._buf = np.ascontiguousarray(buf).reshape(-1)
         self.L.c8_h2d(self.base + self.leaf_off, self._buf.ctypes.data, self._buf.nbytes, self.stream)
 
     def run(self):
@@ -389,14 +417,16 @@ class CountSlicer:
         return buf.reshape(-1)
 
 
-def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=False, mode="stable", confirm=3):
+def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=False, mode="stable", confirm=3,
+                 wide=True):
     """Exact model count of a CNF over variables 1..n using a contraction tree (dict) for the einsum
     built from the clause variable lists with `sliced` variables removed. Returns (count, info).
 
-    mode="rigorous": use primes until their product exceeds 2^(#used vars) (always exact; may run out of
-                     8-bit primes for > ~400 used variables).
+    Moduli: the 54 8-bit moduli (one byte per entry), then, if wide, 16-bit primes (width-2 plan, compiled
+    only when the 8-bit range of ~10^109 does not suffice; twice the memory, about 2-4x the time per pass).
+    mode="rigorous": use moduli until their product exceeds 2^(#used vars) (always exact).
     mode="stable"  : early-terminating CRT: stop when the reconstruction has not changed for `confirm`
-                     extra primes (error probability ~ prod 1/p_i over the confirming primes, ~1e-7 for 3).
+                     extra moduli (error probability ~ prod 1/p_i over the confirming moduli, <= ~1e-7 for 3).
     """
     from .tree_utils import recompute_outputs
     sliced = list(sliced)
@@ -405,34 +435,47 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     slicer = CountSlicer(clauses, sliced)
     ixs = [list(l) for l in slicer.labels]
     d = recompute_outputs(tree, ixs, [])
-    t0 = time.time()
-    ct = CountTree(d, slicer.labels, small_rc=small_rc)
+    need_bits = len(used) + 1           # rigorous bound: count <= 2^(n_used) (free vars are a power of 2)
+    if primes is None:
+        allp = moduli_desc() + (primes16_desc() if wide else [])
+        if mode == "rigorous":
+            primes, bits = [], 0.0
+            for p in allp:
+                if bits > need_bits:
+                    break
+                primes.append(p); bits += math.log2(p)
+            if bits <= need_bits:
+                raise ValueError(f"need > {need_bits} bits but the moduli give only {bits:.0f}")
+        else:
+            primes = allp
+    nsl = 1 << len(sliced)
+    leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
+    residues, used_primes = [], []
+    last, stable = None, 0
+    ct, t_compile, t_run, arena, widths = None, 0.0, 0.0, 0.0, {}
     try:
-        t_compile = time.time() - t0
-        # rigorous bound: count <= 2^(n_used) per... use 2^n_used (free vars handled exactly by a power of 2)
-        need_bits = len(used) + 1
-        if primes is None:
-            if mode == "rigorous":
-                primes, bits = [], 0.0
-                for p in moduli_desc():
-                    if bits > need_bits:
-                        break
-                    primes.append(p); bits += math.log2(p)
-                if bits <= need_bits:
-                    raise ValueError(f"need > {need_bits} bits but 8-bit primes give only {bits:.0f}")
-            else:
-                primes = moduli_desc()
-        nsl = 1 << len(sliced)
-        leaf_bufs = [slicer.leaves(s) for s in range(nsl)] if nsl <= 4096 else None
-        residues, used_primes = [], []
-        t1 = time.time()
-        last, stable = None, 0
         for p in primes:
+            w = width_of(p)
+            if ct is None or ct.width < w:
+                if ct is not None:
+                    ct.free(); ct = None
+                t0 = time.time()
+                try:
+                    ct = CountTree(d, slicer.labels, small_rc=small_rc, width=w)
+                except MemoryError as e:
+                    if w == 1:
+                        raise
+                    raise ValueError(f"16-bit plan does not fit ({e}); the 8-bit moduli (~10^109) did not suffice")
+                t_compile += time.time() - t0
+                arena = max(arena, ct.arena_bytes)
+            t1 = time.time()
             ct.set_prime(p)
             for s in range(nsl):
                 ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer.leaves(s))
                 ct.run()
             residues.append(ct.residue()); used_primes.append(p)
+            t_run += time.time() - t1
+            widths[w] = widths.get(w, 0) + 1
             if mode != "rigorous":
                 val, _ = crt(residues, used_primes)
                 stable = stable + 1 if val == last else 0
@@ -441,15 +484,15 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                     break
         else:
             if mode != "rigorous":
-                raise ValueError("8-bit moduli exhausted before the CRT reconstruction stabilized (count > ~10^109)")
-        primes = used_primes
-        t_run = time.time() - t1
-        count, M = crt(residues, primes)
-        count <<= free_vars
-        info = dict(primes=len(primes), slices=nsl, compile_s=t_compile, run_s=t_run, arena_gib=ct.arena_bytes / 2 ** 30,
-                    nops=ct.nops, per_pass_s=t_run / len(primes))
+                raise ValueError("moduli exhausted before the CRT reconstruction stabilized"
+                                 + ("" if wide else " (8-bit only: count > ~10^109)"))
     finally:
-        ct.free()
+        if ct is not None:
+            ct.free()
+    count, M = crt(residues, used_primes)
+    count <<= free_vars
+    info = dict(primes=len(used_primes), primes16=widths.get(2, 0), slices=nsl, compile_s=t_compile, run_s=t_run,
+                arena_gib=arena / 2 ** 30, per_pass_s=t_run / len(used_primes))
     return count, info
 
 

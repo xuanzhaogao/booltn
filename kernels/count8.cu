@@ -1,4 +1,4 @@
-// count8: exact model counting by tensor-network contraction, one residue class mod a small prime p per pass.
+// count8: exact model counting by tensor-network contraction, one residue class mod a small modulus p per pass.
 //
 // Tensors hold residues mod p (p <= 251) as one byte per entry; a tensor with r binary labels has 2^r bytes,
 // label at position q contributes 2^q to the linear element index (position 0 = fastest). Exact counts are
@@ -44,6 +44,19 @@ __device__ __forceinline__ uint32_t modp(uint32_t x, uint32_t p, uint32_t m) {
   return r >= p ? r - p : r;
 }
 
+// Element width W: 1 = one byte per entry (moduli <= 256); 2 = 16-bit residues (moduli < 2^16) stored as two
+// byte planes, low bytes at [0, 2^r) and high bytes at [ps, ps + 2^r) with plane stride ps = 2^r (rank r).
+template <int W>
+__device__ __forceinline__ uint32_t ld_el(const uint8_t* __restrict__ p, long long x, long long ps) {
+  if constexpr (W == 1) return p[x];
+  else return (uint32_t)p[x] | ((uint32_t)p[x + ps] << 8);
+}
+template <int W>
+__device__ __forceinline__ void st_el(uint8_t* __restrict__ p, long long y, long long ps, uint32_t v) {
+  p[y] = (uint8_t)v;
+  if constexpr (W == 2) p[y + ps] = (uint8_t)(v >> 8);
+}
+
 // ------------------------------- index maps (element index -> source offset) ------------------
 struct IdxMap8 {
   long long T[5][256];  // chunks of 8 index bits (rank <= 40)
@@ -72,8 +85,10 @@ struct Perm8Params {
   int ncomb;
   long long n;  // output elements
 };
+template <int W>
 __global__ void __launch_bounds__(256) perm8_kernel(const uint8_t* __restrict__ in, uint8_t* __restrict__ out,
-                                                    const int* __restrict__ pp, const __grid_constant__ Perm8Params P) {
+                                                    const int* __restrict__ pp, const __grid_constant__ Perm8Params P,
+                                                    long long ps_in, long long ps_out) {
   __shared__ IdxMap8 sm;
   __shared__ long long sr[256];
   for (int i = threadIdx.x; i < (int)(sizeof(IdxMap8) / 8); i += blockDim.x)
@@ -84,11 +99,11 @@ __global__ void __launch_bounds__(256) perm8_kernel(const uint8_t* __restrict__ 
   for (long long y = blockIdx.x * (long long)blockDim.x + threadIdx.x; y < P.n; y += (long long)gridDim.x * blockDim.x) {
     const long long x = map8(sm, y);
     if (P.ncomb == 1) {
-      out[y] = in[x];
+      st_el<W>(out, y, ps_out, ld_el<W>(in, x, ps_in));
     } else {
-      uint32_t s = 0;
-      for (int j = 0; j < P.ncomb; ++j) s += in[x + sr[j]];
-      out[y] = (uint8_t)modp(s, p, mb);
+      uint32_t s = 0;  // <= 256 * (2^16 - 1)
+      for (int j = 0; j < P.ncomb; ++j) s += ld_el<W>(in, x + sr[j], ps_in);
+      st_el<W>(out, y, ps_out, modp(s, p, mb));
     }
   }
 }
@@ -182,6 +197,55 @@ __global__ void __launch_bounds__(256) cco8_kernel(const uint8_t* __restrict__ A
   }
 }
 
+// 16-bit (two-plane) version of cco8: a * (b0 + 256 b1) accumulated as a*b0 and a*b1 (each < 2^28 for K <= 16)
+__global__ void __launch_bounds__(256) cco16_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                    uint8_t* __restrict__ C, const int* __restrict__ pp,
+                                                    long long batch, int mm, int nn, int kk, long long psa,
+                                                    long long psb, long long psc) {
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  const int K = 1 << kk;
+  const long long N16 = 1ll << (nn - 4);
+  const long long total = batch << (mm + nn - 4);
+  for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x; idx < total;
+       idx += (long long)gridDim.x * blockDim.x) {
+    const long long n16 = idx & (N16 - 1);
+    const long long t = idx >> (nn - 4);
+    const long long b = t >> mm;
+    const uint8_t* arow = A + (t << kk);
+    const long long boff = (b << kk) << nn;
+    const uint4* bcol0 = reinterpret_cast<const uint4*>(B + boff) + n16;
+    const uint4* bcol1 = reinterpret_cast<const uint4*>(B + psb + boff) + n16;
+    uint32_t lo[16], hi[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) lo[i] = hi[i] = 0;
+    for (int k = 0; k < K; ++k) {
+      const uint32_t a = (uint32_t)arow[k] | ((uint32_t)arow[k + psa] << 8);
+      const uint4 v0 = __ldg(bcol0 + ((long long)k << (nn - 4))), v1 = __ldg(bcol1 + ((long long)k << (nn - 4)));
+      const uint32_t w0[4] = {v0.x, v0.y, v0.z, v0.w}, w1[4] = {v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          lo[4 * q + e] += a * ((w0[q] >> (8 * e)) & 0xff);
+          hi[4 * q + e] += a * ((w1[q] >> (8 * e)) & 0xff);
+        }
+    }
+    uint32_t o0[4], o1[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      o0[q] = o1[q] = 0;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const uint32_t v = modp((modp(hi[4 * q + e], p, mb) << 8) + modp(lo[4 * q + e], p, mb), p, mb);
+        o0[q] |= (v & 0xff) << (8 * e);
+        o1[q] |= (v >> 8) << (8 * e);
+      }
+    }
+    reinterpret_cast<uint4*>(C + (t << nn))[n16] = make_uint4(o0[0], o0[1], o0[2], o0[3]);
+    reinterpret_cast<uint4*>(C + psc + (t << nn))[n16] = make_uint4(o1[0], o1[1], o1[2], o1[3]);
+  }
+}
+
 // ------------------------------- CUDA-core GEMM (dp4a), split-K --------------------------------
 // A [b][m][k], B [b][n][k] (k fastest, K = 2^kk bytes), C [b][m][n]. Each thread: one output element.
 // lks > 0: blockIdx.y = K chunk; partial sums are atomically added to the int32 scratch `acc` (finalize later).
@@ -231,11 +295,72 @@ __global__ void finalize8_kernel(const int* __restrict__ acc, uint8_t* __restric
     C[i] = (uint8_t)modp((uint32_t)acc[i], p, mb);
 }
 
+// 16-bit (two-plane) version of cc8: four dp4a sums over the byte planes, combined by Horner's rule
+// (s11 * 256 + s01 + s10) * 256 + s00 (mod p)
+__global__ void __launch_bounds__(256) cc16_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                   uint8_t* __restrict__ C, int* __restrict__ acc,
+                                                   const int* __restrict__ pp, long long batch, int mm, int nn,
+                                                   int kk, int lks, long long psa, long long psb, long long psc) {
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  const long long M = 1ll << mm, N = 1ll << nn, K = 1ll << kk;
+  const long long total = batch << (mm + nn);
+  const long long kc = K >> lks;
+  const long long kbeg = (long long)blockIdx.y * kc, kend = kbeg + kc;
+  for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x; idx < total;
+       idx += (long long)gridDim.x * blockDim.x) {
+    const long long n = idx & (N - 1);
+    const long long t = idx >> nn;
+    const long long m = t & (M - 1);
+    const long long b = t >> mm;
+    const uint8_t* a = A + (((b << mm) + m) << kk);
+    const uint8_t* bb = B + (((b << nn) + n) << kk);
+    uint32_t s00 = 0, s01 = 0, s10 = 0, s11 = 0;
+    if (K >= 4) {
+      const uint32_t* a0 = reinterpret_cast<const uint32_t*>(a);
+      const uint32_t* a1 = reinterpret_cast<const uint32_t*>(a + psa);
+      const uint32_t* b0 = reinterpret_cast<const uint32_t*>(bb);
+      const uint32_t* b1 = reinterpret_cast<const uint32_t*>(bb + psb);
+      long long k = kbeg;
+      while (k < kend) {
+        const long long kstop = min(kend, k + 16384);  // 16384 * 255^2 < 2^31
+        for (; k < kstop; k += 4) {
+          const uint32_t x0 = __ldg(a0 + (k >> 2)), x1 = __ldg(a1 + (k >> 2));
+          const uint32_t y0 = __ldg(b0 + (k >> 2)), y1 = __ldg(b1 + (k >> 2));
+          s00 = __dp4a(x0, y0, s00); s01 = __dp4a(x0, y1, s01);
+          s10 = __dp4a(x1, y0, s10); s11 = __dp4a(x1, y1, s11);
+        }
+        if (k < kend) { s00 = modp(s00, p, mb); s01 = modp(s01, p, mb); s10 = modp(s10, p, mb); s11 = modp(s11, p, mb); }
+      }
+    } else {
+      for (long long k = kbeg; k < kend; ++k) {
+        const uint32_t x0 = a[k], x1 = a[k + psa], y0 = bb[k], y1 = bb[k + psb];
+        s00 += x0 * y0; s01 += x0 * y1; s10 += x1 * y0; s11 += x1 * y1;
+      }
+    }
+    uint32_t s = modp(s11, p, mb);
+    s = modp((s << 8) + modp(s01, p, mb) + modp(s10, p, mb), p, mb);
+    s = modp((s << 8) + modp(s00, p, mb), p, mb);
+    if (lks == 0) {
+      st_el<2>(C, idx, psc, s);
+    } else if (s) {
+      atomicAdd(acc + idx, (int)s);  // <= 2^12 partials < 2^16
+    }
+  }
+}
+
+__global__ void finalize16_kernel(const int* __restrict__ acc, uint8_t* __restrict__ C, const int* __restrict__ pp,
+                                  long long n, long long psc) {
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+    st_el<2>(C, i, psc, modp((uint32_t)acc[i], p, mb));
+}
+
 // --------------------------------- tensor-core GEMM (wgmma u8) ---------------------------------
 struct Tc8Params {
   int M, N, Kbytes, batch;
   uint8_t* C;
   long long c_batch_stride;  // bytes
+  long long c_plane;         // W = 2: offset of C's high-byte plane
   int tiles_m, tiles_n, group_m;
   const int* pp;
 };
@@ -262,12 +387,17 @@ __device__ __forceinline__ void tc8_tile_coords(const Tc8Params& p, int tile, in
   tn = rr / gm;
 }
 
-template <int BN, int NWG, int STAGES, bool SMR, int MINB>
+// W = 2 (16-bit residues in byte planes A = A0 + 256 A1, B = B0 + 256 B1): every tile runs four K sweeps,
+// (A1,B1), (A0,B1), (A1,B0), (A0,B0), into the same accumulator, folded by Horner's rule after the first and
+// the third sweep: d <- 256 * (d mod p) (mod p). So d ends as A1B1*2^16 + (A0B1 + A1B0)*2^8 + A0B0 (mod p).
+template <int BN, int NWG, int STAGES, bool SMR, int MINB, int W>
 __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
-    tc8_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB, Tc8Params p) {
+    tc8_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
+               const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CUtensorMap tmB1, Tc8Params p) {
   constexpr int BM = 64 * NWG;
   constexpr int A_BYTES = BM * 128, B_BYTES = BN * 128;
-  constexpr int RED_EVERY = 128;  // stages between mod-p reductions: 128*128*250^2 < 2^31
+  constexpr int RED_EVERY = 128;  // stages between mod-p reductions: 128*128*255^2 + 2^16 < 2^31
+  constexpr int NSEG = W == 2 ? 4 : 1;
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   uint8_t* base = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
   Tc8Smem<BN, NWG, STAGES>& S = *reinterpret_cast<Tc8Smem<BN, NWG, STAGES>*>(base);
@@ -289,13 +419,15 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
       for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
         int b, tm, tn;
         tc8_tile_coords(p, tile, b, tm, tn);
-        for (int kt = 0; kt < KT; ++kt, ++it) {
+        for (int j = 0; j < NSEG * KT; ++j, ++it) {
+          const int seg = W == 2 ? j / KT : 0, kt = j - seg * KT;
+          const bool a1 = W == 2 && (seg == 0 || seg == 2), b1 = W == 2 && seg <= 1;
           int s = it % STAGES;
           mbar_wait(&S.empty[s], ((it / STAGES) & 1) ^ 1);
-          if (kt == 0) S.coord[s] = make_int4(b, tm, tn, 0);
+          if (j == 0) S.coord[s] = make_int4(b, tm, tn, 0);
           mbar_expect_tx(&S.full[s], A_BYTES + B_BYTES);
-          tma_load_3d(S.A[s], &tmA, &S.full[s], kt * 128, tm * BM, b);
-          tma_load_3d(S.B[s], &tmB, &S.full[s], kt * 128, tn * BN, b);
+          tma_load_3d(S.A[s], a1 ? &tmA1 : &tmA, &S.full[s], kt * 128, tm * BM, b);
+          tma_load_3d(S.B[s], b1 ? &tmB1 : &tmB, &S.full[s], kt * 128, tn * BN, b);
         }
       }
     }
@@ -311,11 +443,13 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
     for (int lt = 0; lt < my_tiles; ++lt) {
       int b = 0, tm = 0, tn = 0;
       bool first = true;
+      int since = 0;
       fence_operands(d);
-      for (int kt = 0; kt < KT; ++kt, ++it) {
+      for (int j = 0; j < NSEG * KT; ++j, ++it) {
+        const int kt = W == 2 ? j % KT : j;
         int s = it % STAGES;
         mbar_wait(&S.full[s], (it / STAGES) & 1);
-        if (kt == 0) {
+        if (j == 0) {
           int4 c = S.coord[s];
           b = c.x; tm = c.y; tn = c.z;
         }
@@ -333,13 +467,22 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
         wg_commit();
         fence_operands(d);
         wg_wait<1>();
-        if (kt > 0 && (threadIdx.x & 31) == 0) mbar_arrive(&S.empty[(it - 1) % STAGES]);
-        if (kt % RED_EVERY == RED_EVERY - 1 && kt + 1 < KT) {  // periodic reduction for very long K
+        if (j > 0 && (threadIdx.x & 31) == 0) mbar_arrive(&S.empty[(it - 1) % STAGES]);
+        ++since;
+        if (W == 2 && (j == KT - 1 || j == 3 * KT - 1)) {  // Horner fold between byte-plane sweeps
+          wg_wait<0>();
+          fence_operands(d);
+#pragma unroll
+          for (int i = 0; i < BN / 2; ++i) d[i] = (int)modp(modp((uint32_t)d[i], pr, mbar) << 8, pr, mbar);
+          fence_operands(d);
+          since = 0;
+        } else if (since == RED_EVERY && j + 1 < NSEG * KT) {  // periodic reduction for very long K
           wg_wait<0>();
           fence_operands(d);
 #pragma unroll
           for (int i = 0; i < BN / 2; ++i) d[i] = (int)modp((uint32_t)d[i], pr, mbar);
           fence_operands(d);
+          since = 0;
         }
       }
       wg_wait<0>();
@@ -360,9 +503,11 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
           const uint32_t v1 = modp((uint32_t)d[4 * j + 2 * h + 1], pr, mbar);
           uint8_t* dst = Cb + (long long)row * p.N + col;
           if (col + 1 < p.N) {
-            *reinterpret_cast<uint16_t*>(dst) = (uint16_t)(v0 | (v1 << 8));
+            *reinterpret_cast<uint16_t*>(dst) = (uint16_t)((v0 & 0xff) | ((v1 & 0xff) << 8));
+            if constexpr (W == 2) *reinterpret_cast<uint16_t*>(dst + p.c_plane) = (uint16_t)((v0 >> 8) | (v1 & 0xff00));
           } else if (col < p.N) {
             dst[0] = (uint8_t)v0;
+            if constexpr (W == 2) dst[p.c_plane] = (uint8_t)(v0 >> 8);
           }
         }
       }
@@ -378,7 +523,9 @@ struct SmallOp8 {
   int rc, nk;
   signed char a_pos[24], b_pos[24];
   signed char ka[8], kb[8];
+  long long psa, psb, psc;  // W = 2: plane strides (2^rank) of a, b, c
 };
+template <int W>
 __global__ void __launch_bounds__(256) small8_kernel(const SmallOp8* __restrict__ ops, const int* __restrict__ pp) {
   __shared__ SmallOp8 s;
   __shared__ long long koa[256], kob[256];
@@ -405,15 +552,24 @@ __global__ void __launch_bounds__(256) small8_kernel(const SmallOp8* __restrict_
         if (s.a_pos[q] >= 0) xa += 1ll << s.a_pos[q];
         if (s.b_pos[q] >= 0) xb += 1ll << s.b_pos[q];
       }
-    uint32_t acc = 0;
-    for (int j = 0; j < ncomb; ++j) acc += (uint32_t)s.a[xa + koa[j]] * (uint32_t)s.b[xb + kob[j]];  // <= 256*250^2
-    s.c[y] = (uint8_t)modp(acc, p, mb);
+    if constexpr (W == 1) {
+      uint32_t acc = 0;
+      for (int j = 0; j < ncomb; ++j) acc += (uint32_t)s.a[xa + koa[j]] * (uint32_t)s.b[xb + kob[j]];  // <= 256*255^2
+      s.c[y] = (uint8_t)modp(acc, p, mb);
+    } else {
+      unsigned long long acc = 0;  // <= 256 * (2^16 - 1)^2
+      for (int j = 0; j < ncomb; ++j)
+        acc += (unsigned long long)(ld_el<2>(s.a, xa + koa[j], s.psa) * ld_el<2>(s.b, xb + kob[j], s.psb));
+      st_el<2>(s.c, y, s.psc, (uint32_t)(acc % p));
+    }
   }
 }
 
-// accumulate a scalar (rank-0 root, one byte) into an int32 running sum mod p (sum over slices)
+// accumulate a scalar (rank-0 root: one byte, or two byte planes with stride 1) into an int32 running sum
+// mod p (sum over slices)
+template <int W>
 __global__ void add_accum8_kernel(int* acc, const uint8_t* root, const int* pp) {
-  if (threadIdx.x == 0) acc[0] = (int)(((uint32_t)acc[0] + root[0]) % (uint32_t)*pp);
+  if (threadIdx.x == 0) acc[0] = (int)(((uint32_t)acc[0] + ld_el<W>(root, 0, 1)) % (uint32_t)*pp);
 }
 
 // ------------------------------------- plans ---------------------------------------------------
@@ -432,23 +588,26 @@ static int make_map(CUtensorMap* m, const void* ptr, long long row_bytes, long l
   return r == CUDA_SUCCESS ? 0 : -1;
 }
 
-typedef void (*Tc8KernelPtr)(CUtensorMap, CUtensorMap, Tc8Params);
+typedef void (*Tc8KernelPtr)(CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, Tc8Params);
 struct Tc8Launch {
   Tc8KernelPtr kern;
-  CUtensorMap mA, mB;
+  CUtensorMap mA, mB, mA1, mB1;  // mA1, mB1: high-byte planes (W = 2)
   Tc8Params p;
   int grid, threads;
   size_t smem;
 };
 
-template <int BN, int NWG, int STAGES, bool SMR, int MINB>
+template <int BN, int NWG, int STAGES, bool SMR, int MINB, int W>
 static int prepare_tc8(Tc8Launch& L, const uint8_t* A, const uint8_t* B, uint8_t* C, const int* pp, int bb, int mm,
                        int nn, int kk) {
   constexpr int BM = 64 * NWG;
   long long Kbytes = 1ll << kk;
   if (make_map(&L.mA, A, Kbytes, 1ll << mm, 1ll << bb, BM)) return -1;
   if (make_map(&L.mB, B, Kbytes, 1ll << nn, 1ll << bb, BN)) return -1;
+  if (make_map(&L.mA1, W == 2 ? A + (1ll << (kk + mm + bb)) : A, Kbytes, 1ll << mm, 1ll << bb, BM)) return -1;
+  if (make_map(&L.mB1, W == 2 ? B + (1ll << (kk + nn + bb)) : B, Kbytes, 1ll << nn, 1ll << bb, BN)) return -1;
   Tc8Params& p = L.p;
+  p.c_plane = 1ll << (bb + mm + nn);
   p.M = 1 << mm;
   p.N = 1 << nn;
   p.Kbytes = (int)Kbytes;
@@ -461,7 +620,7 @@ static int prepare_tc8(Tc8Launch& L, const uint8_t* A, const uint8_t* B, uint8_t
   p.pp = pp;
   long long ntiles = (long long)p.tiles_m * p.tiles_n * p.batch;
   if (ntiles >= (1ll << 31)) return -2;
-  auto kern = tc8_kernel<BN, NWG, STAGES, SMR, MINB>;
+  auto kern = tc8_kernel<BN, NWG, STAGES, SMR, MINB, W>;
   L.kern = (Tc8KernelPtr)kern;
   L.smem = sizeof(Tc8Smem<BN, NWG, STAGES>) + 1024;
   L.threads = 128 * (NWG + 1);
@@ -477,6 +636,16 @@ static int prepare_tc8(Tc8Launch& L, const uint8_t* A, const uint8_t* B, uint8_t
   return 0;
 }
 
+
+template <int W>
+static int prepare_tc_cfg(Tc8Launch& L, const uint8_t* A, const uint8_t* B, uint8_t* C, const int* pp, int bb,
+                          int mm, int nn, int kk, int bn, bool two) {
+  if (bn == 256) return two ? prepare_tc8<256, 2, 4, true, 1, W>(L, A, B, C, pp, bb, mm, nn, kk)
+                            : prepare_tc8<256, 1, 4, true, 1, W>(L, A, B, C, pp, bb, mm, nn, kk);
+  if (bn == 128) return two ? prepare_tc8<128, 2, 6, true, 1, W>(L, A, B, C, pp, bb, mm, nn, kk)
+                            : prepare_tc8<128, 1, 4, false, 2, W>(L, A, B, C, pp, bb, mm, nn, kk);
+  return prepare_tc8<64, 1, 4, false, 3, W>(L, A, B, C, pp, bb, mm, nn, kk);
+}
 
 static bool plan_perm8t(Perm8TParams& P, const int* src, int r) {
   if (r < 8 || r > 40) return false;
@@ -548,7 +717,9 @@ static long long grid_for(long long work, int per_block = 256) {
 }
 
 struct Op {
-  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum
+  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8
+  int W = 1;     // element width (bytes per residue, in byte planes)
+  long long psa = 0, psb = 0, psc = 0;  // W = 2: plane strides of the operands / output
   const uint8_t* a = nullptr;
   const uint8_t* b = nullptr;
   uint8_t* c = nullptr;
@@ -562,19 +733,36 @@ struct Op {
   long long nout = 0;
   int launch(cudaStream_t st) const {
     switch (kind) {
-      case 1: perm8_kernel<<<(int)grid, 256, 0, st>>>(a, c, pp, *perm); break;
+      case 1:
+        if (W == 1) perm8_kernel<1><<<(int)grid, 256, 0, st>>>(a, c, pp, *perm, psa, psc);
+        else perm8_kernel<2><<<(int)grid, 256, 0, st>>>(a, c, pp, *perm, psa, psc);
+        break;
       case 2: {
         if (lks) C8_CHECK(cudaMemsetAsync(acc, 0, nout * 4, st));
         dim3 g((unsigned)grid, 1u << lks);
-        cc8_kernel<<<g, 256, 0, st>>>(a, b, c, acc, pp, 1ll << bb, mm, nn, kk, lks);
-        if (lks) finalize8_kernel<<<(int)grid_for(nout), 256, 0, st>>>(acc, c, pp, nout);
+        if (W == 1) {
+          cc8_kernel<<<g, 256, 0, st>>>(a, b, c, acc, pp, 1ll << bb, mm, nn, kk, lks);
+          if (lks) finalize8_kernel<<<(int)grid_for(nout), 256, 0, st>>>(acc, c, pp, nout);
+        } else {
+          cc16_kernel<<<g, 256, 0, st>>>(a, b, c, acc, pp, 1ll << bb, mm, nn, kk, lks, psa, psb, psc);
+          if (lks) finalize16_kernel<<<(int)grid_for(nout), 256, 0, st>>>(acc, c, pp, nout, psc);
+        }
         break;
       }
-      case 3: tc.kern<<<tc.grid, tc.threads, tc.smem, st>>>(tc.mA, tc.mB, tc.p); break;
-      case 4: small8_kernel<<<(int)grid, 256, 0, st>>>((const SmallOp8*)a, pp); break;
-      case 5: add_accum8_kernel<<<1, 32, 0, st>>>(acc, a, pp); break;
+      case 3: tc.kern<<<tc.grid, tc.threads, tc.smem, st>>>(tc.mA, tc.mB, tc.mA1, tc.mB1, tc.p); break;
+      case 4:
+        if (W == 1) small8_kernel<1><<<(int)grid, 256, 0, st>>>((const SmallOp8*)a, pp);
+        else small8_kernel<2><<<(int)grid, 256, 0, st>>>((const SmallOp8*)a, pp);
+        break;
+      case 5:
+        if (W == 1) add_accum8_kernel<1><<<1, 32, 0, st>>>(acc, a, pp);
+        else add_accum8_kernel<2><<<1, 32, 0, st>>>(acc, a, pp);
+        break;
       case 6: perm8t_kernel<<<(int)grid, 256, 0, st>>>(a, c, *permt); break;
-      case 7: cco8_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk); break;
+      case 7:
+        if (W == 1) cco8_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk);
+        else cco16_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk, psa, psb, psc);
+        break;
       default: return -9;
     }
     C8_CHECK(cudaGetLastError());
@@ -583,6 +771,7 @@ struct Op {
 };
 
 struct Plan {
+  int W = 1;
   std::vector<Op> ops;
   std::vector<void*> dev_bufs;
   cudaGraphExec_t exec = nullptr;
@@ -656,6 +845,13 @@ float c8_event_elapsed(void* e0, void* e1) {
 }
 
 void* c8_plan_new() { return new Plan(); }
+// W = 2: every tensor holds 16-bit residues as two byte planes (see ld_el); moduli up to 65536
+void* c8_plan_new_w(int W) {
+  if (W != 1 && W != 2) return nullptr;
+  Plan* P = new Plan();
+  P->W = W;
+  return P;
+}
 int c8_plan_free(void* h) {
   Plan* P = (Plan*)h;
   for (void* q : P->dev_bufs) cudaFree(q);
@@ -673,9 +869,14 @@ int c8_plan_permute(void* h, const uint8_t* in, uint8_t* out, int rout, const in
   op.a = in;
   op.c = out;
   op.pp = pp;
+  op.W = P->W;
+  op.psa = 1ll << (rout + nred);  // the input's labels are the output's plus the summed ones
+  op.psc = 1ll << rout;
   if (nred == 0) {
     op.permt.reset(new Perm8TParams);
-    if (plan_perm8t(*op.permt, src_pos, rout)) {
+    std::vector<int> src(src_pos, src_pos + rout);
+    if (P->W == 2) src.push_back(rout);  // the byte plane as one more (slowest) label, kept in place
+    if (rout + P->W - 1 <= 40 && plan_perm8t(*op.permt, src.data(), rout + P->W - 1)) {
       op.kind = 6;
       op.grid = std::min<long long>(op.permt->nouter, (long long)g_nsm * 16);
       return 0;
@@ -705,6 +906,8 @@ int c8_plan_cc(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int* scr
   op.kind = 2;
   op.a = A; op.b = B; op.c = C; op.acc = scratch; op.pp = pp;
   op.bb = bb; op.mm = mm; op.nn = nn; op.kk = kk;
+  op.W = P->W;
+  op.psa = 1ll << (bb + mm + kk); op.psb = 1ll << (bb + nn + kk); op.psc = 1ll << (bb + mm + nn);
   op.nout = 1ll << (bb + mm + nn);
   op.lks = 0;
   if (scratch)
@@ -719,21 +922,21 @@ int c8_plan_tc(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb, 
   P->ops.emplace_back();
   Op& op = P->ops.back();
   op.kind = 3;
+  op.W = P->W;
   int bn = nn >= 8 ? 256 : (nn >= 7 ? 128 : 64);
   bool two = mm >= 7;
   int rc;
-  if (bn == 256) rc = two ? prepare_tc8<256, 2, 4, true, 1>(op.tc, A, B, C, pp, bb, mm, nn, kk)
-                          : prepare_tc8<256, 1, 4, true, 1>(op.tc, A, B, C, pp, bb, mm, nn, kk);
-  else if (bn == 128) rc = two ? prepare_tc8<128, 2, 6, true, 1>(op.tc, A, B, C, pp, bb, mm, nn, kk)
-                               : prepare_tc8<128, 1, 4, false, 2>(op.tc, A, B, C, pp, bb, mm, nn, kk);
-  else rc = prepare_tc8<64, 1, 4, false, 3>(op.tc, A, B, C, pp, bb, mm, nn, kk);
+  if (P->W == 1) rc = prepare_tc_cfg<1>(op.tc, A, B, C, pp, bb, mm, nn, kk, bn, two);
+  else rc = prepare_tc_cfg<2>(op.tc, A, B, C, pp, bb, mm, nn, kk, bn, two);
   if (rc) P->ops.pop_back();
   return rc;
 }
 // n small contractions in one launch; flat arrays: ptrs[3n], rc[n], nk[n], apos[24n], bpos[24n], ka[8n], kb[8n]
-int c8_plan_small_batch(void* h, int n, void** ptrs, const int* rc, const int* nk, const int* apos, const int* bpos,
-                        const int* ka, const int* kb, const int* pp) {
+// ra, rb: ranks of each op's operands (plane strides for W = 2; may be null for W = 1)
+int c8_plan_small_batch2(void* h, int n, void** ptrs, const int* rc, const int* nk, const int* apos, const int* bpos,
+                         const int* ka, const int* kb, const int* ra, const int* rb, const int* pp) {
   Plan* P = (Plan*)h;
+  if (P->W == 2 && (!ra || !rb)) return -3;
   std::vector<SmallOp8> v(n);
   for (int i = 0; i < n; ++i) {
     SmallOp8& o = v[i];
@@ -745,6 +948,9 @@ int c8_plan_small_batch(void* h, int n, void** ptrs, const int* rc, const int* n
     if (o.rc > 24 || o.nk > 8) return -3;
     for (int q = 0; q < 24; ++q) { o.a_pos[q] = (signed char)apos[24 * i + q]; o.b_pos[q] = (signed char)bpos[24 * i + q]; }
     for (int q = 0; q < 8; ++q) { o.ka[q] = (signed char)ka[8 * i + q]; o.kb[q] = (signed char)kb[8 * i + q]; }
+    o.psa = ra ? 1ll << ra[i] : 0;
+    o.psb = rb ? 1ll << rb[i] : 0;
+    o.psc = 1ll << o.rc;
   }
   void* d = nullptr;
   C8_CHECK(cudaMalloc(&d, sizeof(SmallOp8) * n));
@@ -753,10 +959,15 @@ int c8_plan_small_batch(void* h, int n, void** ptrs, const int* rc, const int* n
   P->ops.emplace_back();
   Op& op = P->ops.back();
   op.kind = 4;
+  op.W = P->W;
   op.a = (const uint8_t*)d;
   op.pp = pp;
   op.grid = n;
   return 0;
+}
+int c8_plan_small_batch(void* h, int n, void** ptrs, const int* rc, const int* nk, const int* apos, const int* bpos,
+                        const int* ka, const int* kb, const int* pp) {
+  return c8_plan_small_batch2(h, n, ptrs, rc, nk, apos, bpos, ka, kb, nullptr, nullptr, pp);
 }
 // small-K CUDA-core GEMM: A [b][m][k], B [b][k][n] (n fastest), kk <= 4, nn >= 4
 int c8_plan_cco(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb, int mm, int nn, int kk, const int* pp) {
@@ -767,6 +978,8 @@ int c8_plan_cco(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb,
   op.kind = 7;
   op.a = A; op.b = B; op.c = C; op.pp = pp;
   op.bb = bb; op.mm = mm; op.nn = nn; op.kk = kk;
+  op.W = P->W;
+  op.psa = 1ll << (bb + mm + kk); op.psb = 1ll << (bb + kk + nn); op.psc = 1ll << (bb + mm + nn);
   op.grid = grid_for((1ll << (bb + mm + nn - 4)));
   return 0;
 }
@@ -776,6 +989,7 @@ int c8_plan_add_accum(void* h, int* acc, const uint8_t* root, const int* pp) {
   P->ops.emplace_back();
   Op& op = P->ops.back();
   op.kind = 5;
+  op.W = P->W;
   op.acc = acc;
   op.a = root;
   op.pp = pp;
