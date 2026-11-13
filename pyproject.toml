@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "booltn"
+version = "0.1.0"
+description = "Boolean tensor-network contraction (SAT and exact #SAT) on NVIDIA Hopper 1-bit / int8 tensor cores"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# contraction orders come from omeco (https://github.com/GiggleLiu/omeco, python bindings built with maturin);
+# python-sat gives the minisat ground truth in run_sat and the tests.
+sat = ["python-sat"]
+
+[project.scripts]
+booltn-sat = "booltn.run_sat:main"
+booltn-count = "booltn.run_count:main"
+
+[tool.setuptools]
+packages = ["booltn"]
+
+[tool.setuptools.package-data]
+booltn = ["lib/*.so"]
