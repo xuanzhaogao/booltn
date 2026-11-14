@@ -76,6 +76,57 @@ def clean_clauses(clauses):
     return out, empty
 
 
+def split_wide_clauses(clauses, n, max_rank):
+    """Rewrite every clause wider than max_rank as a chain of clauses of width <= max_rank through auxiliary
+    variables n+1, n+2, ... that are functions of the original ones, so the model count is unchanged (and so is
+    satisfiability). A wide XOR (all 2^(k-1) clauses of one parity on k variables, k > max_rank) becomes a chain of
+    narrow XORs, t_1 = x_1 + ... , t_j = t_(j-1) + ...; any other wide clause (l_1 v ... v l_k) becomes
+    t_1 <=> (l_1 v ... v l_c), t_j <=> (t_(j-1) v ...), (t_last v remaining literals).
+    Returns (clauses, n_total, stats)."""
+    from .reduce import detect_xors
+    wide = [c for c in clauses if len(c) > max_rank]
+    if not wide:
+        return clauses, n, dict(split_or=0, split_xor=0, aux=0)
+    xors, members = detect_xors(wide, max_k=max(len(c) for c in wide), members=True)
+    out = [c for c in clauses if len(c) <= max_rank]
+    top = n
+    chunk = max(1, max_rank - 2)
+
+    def xor_cl(vs, rhs):          # clauses of XOR(vs) == rhs over 1-based variables
+        res = []
+        for m in range(1 << len(vs)):
+            if bin(m).count("1") % 2 != rhs:
+                res.append([-v if (m >> i) & 1 else v for i, v in enumerate(vs)])
+        return res
+
+    for vs, rhs in xors:                         # vs 0-based
+        vs = [v + 1 for v in vs]
+        acc, rest = None, list(vs)
+        while len(rest) + (acc is not None) > max_rank:
+            take = rest[: chunk + (1 if acc is None else 0)]
+            rest = rest[len(take):]
+            top += 1
+            out += xor_cl(([acc] if acc else []) + take + [top], 0)     # top = acc + take
+            acc = top
+        out += xor_cl(([acc] if acc else []) + rest, rhs)
+    nor = 0
+    for c in wide:
+        if frozenset(c) in members:
+            continue
+        nor += 1
+        acc, rest = None, list(c)
+        while len(rest) + (acc is not None) > max_rank:
+            take = rest[: chunk + (1 if acc is None else 0)]
+            rest = rest[len(take):]
+            top += 1
+            t = top
+            src = ([acc] if acc else []) + take                    # t <=> OR(src)
+            out += [[-l, t] for l in src] + [[-t] + src]
+            acc = t
+        out.append([acc] + rest)
+    return out, top, dict(split_or=nor, split_xor=len(xors), aux=top - n)
+
+
 def check_model(clauses, model):
     true = set(l for l in model if l)
     return all(any(l in true for l in c) for c in clauses)
@@ -86,7 +137,7 @@ class BranchSolver:
                  lp_max_depth=None, candidates=12, order="auto", ntrials=4, niters=20, tree=None,
                  leaf="gpu", time_limit=3600.0, max_nodes=1000000, mode="decide", count_mode="stable", pool=None,
                  cms_root_time=60.0, cms_node_confl=2000, count_moduli=None, max_splits=16, mip_root_time=None,
-                 leaf_cache=None, cubes=None, verbose=0):
+                 leaf_cache=None, cubes=None, split_wide=True, verbose=0):
         """pool: a booltn.multigpu.GpuPool; leaves then run asynchronously on its GPUs while the search
         continues (decide: the first SAT leaf ends the search; count: leaf counts are summed).
         cubes: file that gets one JSON line per closed node: its branching decisions (literals, DIMACS) and why it
@@ -103,11 +154,16 @@ class BranchSolver:
                                             # plan, twice the memory, does not fit; each split lowers sc)
         self.mode, self.count_mode = mode, count_mode
         self.orig, self.empty = clean_clauses(clauses)
-        self.n = n
         self.sc_leaf = sc_leaf
         # widest clause a GPU leaf takes (engine.CompiledTree: rank <= 16; count_engine.CountTree: rank <= 5);
-        # a node whose residual has a wider clause branches on that clause's literals first
+        # wider clauses are rewritten as chains through functional auxiliary variables (split_wide), and a node
+        # whose residual still has a wider clause branches on that clause's literals first
         self.leaf_max_rank = 5 if mode == "count" else 16
+        self.n_orig = n
+        self.split_stats = dict(split_or=0, split_xor=0, aux=0)
+        if split_wide and not self.empty:
+            self.orig, n, self.split_stats = split_wide_clauses(self.orig, n, self.leaf_max_rank)
+        self.n = n
         self.use_xor, self.use_lp = use_xor, use_lp
         self.cdcl_root, self.cdcl_node = cdcl_root, cdcl_node
         self.lp_max_depth = lp_max_depth
@@ -121,6 +177,8 @@ class BranchSolver:
         self.st = dict(nodes=0, leaves=0, branches=0, failed_literals=0, max_depth=0,
                        pruned=dict(prop=0, xor=0, lp=0, cdcl=0), xor_closed=0, root_sc=None, root_tc=None,
                        t_root=0.0, t_order=0.0, t_reduce=0.0, t_select=0.0, t_leaf=0.0, leaf_sc_max=0)
+        if self.split_stats["aux"]:
+            self.st.update(self.split_stats)
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 10 * len(self.orig) + 1000))
         self.cache, self.cache_path = {}, leaf_cache   # residual-formula hash -> model count over its variables
         if leaf_cache and mode == "count" and os.path.exists(leaf_cache):

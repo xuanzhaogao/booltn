@@ -64,19 +64,20 @@ def main():  # guarded: the GPU pool spawns workers that re-import this file
                                       ("count, 8-literal clause", 20, 40, 8, "count", 8)]:
         rng = random.Random(seed)
         cl = random_ksat(n, m, 3, seed) + [[v * rng.choice([1, -1]) for v in rng.sample(range(1, n + 1), w)]]
-        r = BranchSolver(cl, n, mode=mode, sc_leaf=32, cdcl_root=0, cdcl_node=0, use_xor=False, use_lp=False,
-                         ntrials=1, niters=5).solve()
+        kw = dict(mode=mode, sc_leaf=32, cdcl_root=0, cdcl_node=0, use_xor=False, use_lp=False, ntrials=1, niters=5)
+        r = BranchSolver(cl, n, split_wide=False, **kw).solve()          # fallback: branch on the wide clause
+        r2 = BranchSolver(cl, n, **kw).solve()                            # default: chain through auxiliary bits
         if mode == "count":
             want = brute(cl, n)
-            good = r.count == want and r.stats.get("wide_branches", 0) > 0
-            got = f"count {r.count} (brute force {want})"
+            good = r.count == want == r2.count and r.stats.get("wide_branches", 0) > 0 and r2.stats.get("aux", 0) > 0
+            got = f"count {r.count} / split {r2.count} (brute force {want})"
         else:
             want = truth(cl)
-            good = r.status == want and r.stats.get("wide_branches", 0) > 0
-            got = f"{r.status} (minisat {want})"
+            good = r.status == want == r2.status and r.stats.get("wide_branches", 0) > 0 and r2.stats.get("aux", 0) > 0
+            got = f"{r.status} / split {r2.status} (minisat {want})"
         ok &= good
         print(f"{'PASS' if good else 'FAIL'} {name:26s} {got}, {r.stats.get('wide_branches', 0)} wide-clause "
-              f"branches, {r.stats['leaves']} GPU leaves")
+              f"branches, {r.stats['leaves']} GPU leaves; split: {r2.stats.get('aux', 0)} auxiliary bits")
     # formulas that are empty once tautologies are dropped (MCC 2020 track 1 #000 is "1 -1 0"): every assignment
     for cl, n, want in (([[1, -1]], 1, 2), ([[1, -1], [2, -2, 3]], 3, 8)):
         r = BranchSolver(cl, n, mode="count", cdcl_root=0, cdcl_node=0).solve()
