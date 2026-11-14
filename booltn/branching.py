@@ -557,6 +557,8 @@ class BranchSolver:
                     shape = None
                     if d is None and self.pool is not None:      # C measure: the workers only need the shape
                         res, shape = self._tm.residual(), self._tm.post()
+                    elif d is None and self.leaf == "skip":      # the leaf is not decided: no tree needed
+                        res = self._tm.residual()
                     elif d is None:
                         res, d, ixs, tc, sc = self._measure(lits)
                     wide = max(res, key=len)
