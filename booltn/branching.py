@@ -235,6 +235,11 @@ class BranchSolver:
         t = time.time()
         if self.empty:
             return self._unsat("empty-clause")
+        if not self.orig:          # nothing left after dropping tautologies (the CDCL wrapper reports an empty formula as
+            self.st["t_root"] = time.time() - t                                       # a conflict): every assignment
+            if self.mode == "count":
+                return Result("COUNT", "prop", self.st, count=1 << self.n)
+            return Result("SAT", "prop", self.st)
         self.cdcl = CDCL(self.orig, cms=bool(self.cms_root_time or self.cms_node_confl))
         ok, implied = self.cdcl.propagate([])
         if not ok:

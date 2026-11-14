@@ -77,6 +77,12 @@ def main():  # guarded: the GPU pool spawns workers that re-import this file
         ok &= good
         print(f"{'PASS' if good else 'FAIL'} {name:26s} {got}, {r.stats.get('wide_branches', 0)} wide-clause "
               f"branches, {r.stats['leaves']} GPU leaves")
+    # formulas that are empty once tautologies are dropped (MCC 2020 track 1 #000 is "1 -1 0"): every assignment
+    for cl, n, want in (([[1, -1]], 1, 2), ([[1, -1], [2, -2, 3]], 3, 8)):
+        r = BranchSolver(cl, n, mode="count", cdcl_root=0, cdcl_node=0).solve()
+        good = r.count == want
+        ok &= good
+        print(f"{'PASS' if good else 'FAIL'} only tautologies {cl}: count {r.count} (want {want})")
     # leaf cache: a count stopped by a node limit, resumed from its journal, must give the brute-force count, take
     # leaves from the journal, and a third run must take all of them from it; serial leaves and a one-GPU pool
     import os, tempfile
