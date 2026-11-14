@@ -105,6 +105,9 @@ class BranchSolver:
         self.orig, self.empty = clean_clauses(clauses)
         self.n = n
         self.sc_leaf = sc_leaf
+        # widest clause a GPU leaf takes (engine.CompiledTree: rank <= 16; count_engine.CountTree: rank <= 5);
+        # a node whose residual has a wider clause branches on that clause's literals first
+        self.leaf_max_rank = 5 if mode == "count" else 16
         self.use_xor, self.use_lp = use_xor, use_lp
         self.cdcl_root, self.cdcl_node = cdcl_root, cdcl_node
         self.lp_max_depth = lp_max_depth
@@ -556,6 +559,18 @@ class BranchSolver:
                         res, shape = self._tm.residual(), self._tm.post()
                     elif d is None:
                         res, d, ixs, tc, sc = self._measure(lits)
+                    wide = max(res, key=len)
+                    if len(wide) > self.leaf_max_rank:   # every leaf mode, so --leaf skip gives the same tree
+                        # too wide for a leaf tensor: branch on its first literal (true: the clause is
+                        # satisfied; false: one literal shorter), at most rank - leaf_max_rank + 1 extra leaves
+                        lit = wide[0]
+                        self.st["branches"] += 1
+                        self.st["wide_branches"] = self.st.get("wide_branches", 0) + 1
+                        self.log(f"depth {depth}: tc 2^{tc:.1f} sc 2^{sc} -> branch on a clause of {len(wide)} "
+                                 f"literals (leaf tensors have rank <= {self.leaf_max_rank})")
+                        for lit2 in (-lit, lit):     # the satisfying child is explored first
+                            stack.append((lits + [lit2], depth + 1, False, splits, dec + (lit2,)))
+                        break
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
                     self._cube("leaf")
                     if self.pool is not None:

@@ -56,6 +56,27 @@ def main():  # guarded: the GPU pool spawns workers that re-import this file
         ok &= good
         print(f"{'PASS' if good else 'FAIL'} {name:26s} count {r.count} (brute force {want}), {r.stats['leaf_splits']} leaf splits, "
               f"{r.stats['leaves']} leaves")
+    # clauses wider than a leaf tensor (decide: rank 16, count: rank 5) with sc_leaf above their width: the node
+    # branches on the wide clause first (SAT Comp 2026 linvrinv5 has a 25-literal clause and crashed the leaf)
+    import random
+    for name, n, m, w, mode, seed in [("decide, 25-literal clause", 40, 170, 25, "decide", 2),
+                                      ("decide, 20-literal clause", 45, 190, 20, "decide", 4),
+                                      ("count, 8-literal clause", 20, 40, 8, "count", 8)]:
+        rng = random.Random(seed)
+        cl = random_ksat(n, m, 3, seed) + [[v * rng.choice([1, -1]) for v in rng.sample(range(1, n + 1), w)]]
+        r = BranchSolver(cl, n, mode=mode, sc_leaf=32, cdcl_root=0, cdcl_node=0, use_xor=False, use_lp=False,
+                         ntrials=1, niters=5).solve()
+        if mode == "count":
+            want = brute(cl, n)
+            good = r.count == want and r.stats.get("wide_branches", 0) > 0
+            got = f"count {r.count} (brute force {want})"
+        else:
+            want = truth(cl)
+            good = r.status == want and r.stats.get("wide_branches", 0) > 0
+            got = f"{r.status} (minisat {want})"
+        ok &= good
+        print(f"{'PASS' if good else 'FAIL'} {name:26s} {got}, {r.stats.get('wide_branches', 0)} wide-clause "
+              f"branches, {r.stats['leaves']} GPU leaves")
     # leaf cache: a count stopped by a node limit, resumed from its journal, must give the brute-force count, take
     # leaves from the journal, and a third run must take all of them from it; serial leaves and a one-GPU pool
     import os, tempfile
