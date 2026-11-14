@@ -54,6 +54,14 @@ def flatten_tree(tree):
 
 
 def unflatten_tree(flat):
+    """Inverse of flatten_tree; also takes measure.TreeMeasure.post()'s ("post", t, l, r) arrays (shape only:
+    internal outputs empty, for callers that run recompute_outputs)."""
+    if isinstance(flat, tuple) and flat and flat[0] == "post":
+        nodes = []
+        for t, l, r in zip(flat[1].tolist(), flat[2].tolist(), flat[3].tolist()):
+            nodes.append({"tensor_index": t} if t >= 0 else
+                         {"args": [nodes[l], nodes[r]], "eins": {"ixs": [], "iy": []}})
+        return nodes[-1]
     nodes = []
     for e in flat:
         if e[0] == "L":

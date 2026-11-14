@@ -29,6 +29,10 @@ def _lib():
         L.btm_tcsc.argtypes = [ctypes.c_int, P, P, P, P, P, ctypes.c_int, P, P, P, P, P,
                                ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int32)]
         L.btm_tcsc.restype = ctypes.c_int
+        if hasattr(L, "btm_tcsc_batch"):       # lookahead children in parallel (OpenMP)
+            I = ctypes.c_int
+            L.btm_tcsc_batch.argtypes = [I, P, P, P, P, P, I, I, P, I, P, P, P, P, P, P]
+            L.btm_tcsc_batch.restype = None
         if hasattr(L, "btm_iy"):               # ordered output labels (TreeMeasure.big_labels / .tree)
             L.btm_iy.argtypes = [ctypes.c_int, P, P, P, P, P, ctypes.c_int, P, P, P, P, P, P, P, ctypes.c_int, P]
             L.btm_iy.restype = ctypes.c_int
@@ -74,6 +78,11 @@ class TreeMeasure:
         self.eff = np.zeros(self.nn, dtype=np.int32)
         self.terms = np.zeros(self.nn, dtype=np.float64)
         self.val = np.zeros(n + 1, dtype=np.int8)
+        # tcsc_batch: threads (BOOLTN_LOOKAHEAD_THREADS, default min(8, CPUs of this process)), each with its
+        # own sub/ext buffers, at most ~1 GiB of them
+        thr = int(os.environ.get("BOOLTN_LOOKAHEAD_THREADS", min(8, len(os.sched_getaffinity(0)))))
+        self.nslot = max(1, min(thr, (1 << 30) // max(1, 16 * self.nn * W)))
+        self._bufs = None
 
     def tcsc(self, lits):
         L = _lib()
@@ -88,6 +97,35 @@ class TreeMeasure:
                    p(self.sub), p(self.ext), p(self.eff), p(self.terms), ctypes.byref(tc), ctypes.byref(sc))
         self._iy = None
         return tc.value, sc.value
+
+    def tcsc_batch(self, lits_list):
+        """[tcsc(lits) for lits in lits_list], evaluated in parallel; leaves no state for keep()/iy()/..."""
+        L = _lib()
+        k = len(lits_list)
+        if k == 0:
+            return []
+        if self.nslot == 1 or k == 1 or not hasattr(L, "btm_tcsc_batch"):
+            out = [self.tcsc(l) for l in lits_list]
+            self._iy = None
+            return out
+        if self._bufs is None:
+            W = self.n // 64 + 1
+            self._bufs = (np.zeros(self.nslot * self.nn * W, dtype=np.uint64),
+                          np.zeros(self.nslot * self.nn * W, dtype=np.uint64),
+                          np.zeros(self.nslot * self.nn, dtype=np.int32),
+                          np.zeros(self.nslot * self.nn, dtype=np.float64))
+        vals = np.zeros((k, self.n + 1), dtype=np.int8)
+        for i, lits in enumerate(lits_list):
+            if lits:
+                a = np.asarray(lits, dtype=np.int64)
+                vals[i, np.abs(a)] = np.where(a > 0, 1, -1)
+        tc = np.zeros(k, dtype=np.float64)
+        sc = np.zeros(k, dtype=np.int32)
+        p = lambda x: x.ctypes.data
+        sub, ext, eff, terms = self._bufs
+        L.btm_tcsc_batch(self.nn, p(self.leaf), p(self.left), p(self.right), p(self.cptr), p(self.clit), self.n, k,
+                         p(vals), self.nslot, p(sub), p(ext), p(eff), p(terms), p(tc), p(sc))
+        return list(zip(tc.tolist(), sc.tolist()))
 
     # --- after tcsc(lits), for the same assignment ---------------------------------------------------------
     def has_iy(self):
@@ -142,6 +180,24 @@ class TreeMeasure:
             for l in ar[o:o + k]:
                 w[l] = w.get(l, 0) + x
         return sorted(w, key=lambda l: -w[l])
+
+    def post(self):
+        """The restricted tree's shape for a leaf worker (multigpu.unflatten_tree, which leaves the outputs to
+        recompute_outputs): ("post", t, l, r) over the live nodes in post-order, t[k] = tensor index (position in
+        keep()) of a leaf, else -1 and l[k], r[k] = positions of the children."""
+        live = np.nonzero(self.eff == np.arange(self.nn))[0]
+        at = np.full(self.nn, -1, dtype=np.int64)
+        at[live] = np.arange(len(live))
+        lf = self.leaf[live]
+        isl = lf >= 0
+        t = np.full(len(live), -1, dtype=np.int64)
+        t[isl] = np.searchsorted(self.keep(), lf[isl])
+        l = np.full(len(live), -1, dtype=np.int64)
+        r = np.full(len(live), -1, dtype=np.int64)
+        j = live[~isl]
+        l[~isl] = at[self.eff[self.left[j]]]
+        r[~isl] = at[self.eff[self.right[j]]]
+        return ("post", t, l, r)
 
     def tree(self, ixs):
         """recompute_outputs(prune_tree(tree, keep()), ixs, []): ixs[i] = labels of the i-th live clause."""

@@ -23,7 +23,7 @@ $(LIBDIR)/libcount8.so: count8.cu bgemm_sm90.cuh wgmma_u8.inc | $(LIBDIR)
 	$(NVCC) $(NVFLAGS) -shared -Xcompiler -fPIC -o $@.tmp count8.cu && mv -f $@.tmp $@
 
 $(LIBDIR)/libbtmeasure.so: measure.c gf2.c | $(LIBDIR)
-	$(CC) -O3 -mpopcnt -fPIC -shared -o $@.tmp measure.c gf2.c -lm && mv -f $@.tmp $@
+	$(CC) -O3 -mpopcnt -fopenmp -fPIC -shared -o $@.tmp measure.c gf2.c -lm && mv -f $@.tmp $@
 
 measure: $(LIBDIR)/libbtmeasure.so
 

@@ -9,6 +9,7 @@ from booltn.satgen import random_ksat
 from booltn.hard_families import tseitin_grid
 from booltn.branching import BranchSolver
 from booltn.measure import TreeMeasure, available
+from booltn.multigpu import unflatten_tree
 from booltn.slicer import _big_labels
 from booltn.tree_utils import complexity, prune_tree, recompute_outputs
 
@@ -39,22 +40,28 @@ def main():
         vs = sorted({abs(l) for c in bs.clauses for l in c})
         rng = random.Random(7)
         bad = 0
+        batch = []
         for _ in range(300):
             k = rng.choice([0, 1, 3, 10, len(vs) // 3, len(vs)])
             lits = list(bs.root_lits) + [v if rng.random() < .5 else -v for v in rng.sample(vs, min(k, len(vs)))]
             keep, res, d, ixs, tc, sc = py_measure(bs, lits)
+            batch.append((lits, (tc, sc)))
             bad += (tc, sc) != tm.tcsc(lits)
             bad += keep != tm.keep().tolist()
             if res and tm.has_iy():                # btm_iy: library built from this version
                 bad += res != tm.residual()
                 bad += d != tm.tree(ixs)
+                bad += recompute_outputs(unflatten_tree(tm.post()), ixs, []) != d     # leaf-worker shape
                 for tgt in {0, 3, 8, max(0, sc - 3)}:
                     bad += _big_labels(d, ixs, tgt) != tm.big_labels(tgt)
             m = bs._measure(lits)                    # BranchSolver's own path (C when built)
             bad += (m[0] != res) + (m[1] != d) + (tuple(m[3:]) != (tc, sc))
+        for i in range(0, len(batch), 24):        # the lookahead's parallel batch (24 children)
+            got = tm.tcsc_batch([l for l, _ in batch[i:i + 24]])
+            bad += sum(g != w for g, (_, w) in zip(got, batch[i:i + 24]))
         ok &= bad == 0
         print(f"{'PASS' if bad == 0 else 'FAIL'} {name:24s} {tm.nn} tree nodes, 300 assignments, {bad} mismatches "
-              "(tc/sc, live clauses, residual, tree, candidates)")
+              "(tc/sc, batched tc/sc, live clauses, residual, tree, worker shape, candidates)")
     print("ALL PASSED" if ok else "SOME FAILED")
     sys.exit(0 if ok else 1)
 

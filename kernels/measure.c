@@ -135,3 +135,23 @@ int btm_iy(int nn, const int32_t *leaf_clause, const int32_t *left, const int32_
     }
     return used;
 }
+
+/* btm_tcsc for k assignments at once (the lookahead children of one node), in parallel (OpenMP): vals is
+ * k x (n + 1) (row a = val of assignment a); each thread uses its own work buffers, slot t of sub/ext
+ * (nslot x nn x W words), eff/terms (nslot x nn). tc[a], sc[a] as btm_tcsc. nslot >= the number of threads. */
+#include <omp.h>
+void btm_tcsc_batch(int nn, const int32_t *leaf_clause, const int32_t *left, const int32_t *right,
+                    const int32_t *cptr, const int32_t *clit, int n, int k, const int8_t *vals,
+                    int nslot, uint64_t *sub, uint64_t *ext, int32_t *eff, double *terms, double *tc, int32_t *sc)
+{
+    const size_t W = (size_t)(n / 64 + 1);
+    int nt = nslot < k ? nslot : k;
+    if (nt < 1) nt = 1;
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int a = 0; a < k; a++) {
+        int t = omp_get_thread_num();
+        btm_tcsc(nn, leaf_clause, left, right, cptr, clit, n, vals + (size_t)a * (n + 1),
+                 sub + (size_t)t * nn * W, ext + (size_t)t * nn * W, eff + (size_t)t * nn, terms + (size_t)t * nn,
+                 tc + a, sc + a);
+    }
+}

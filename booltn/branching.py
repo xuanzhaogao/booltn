@@ -362,9 +362,11 @@ class BranchSolver:
         self.st["t_leaf"] += time.time() - t
         return c << (self._nfree(lits) - len(used))
 
-    def _submit_leaf(self, res, d, lits, tc=0.0):
-        """Asynchronous leaf on the pool -> appended to self.pending as (future, shift)."""
+    def _submit_leaf(self, res, d, lits, tc=0.0, shape=None):
+        """Asynchronous leaf on the pool -> appended to self.pending as (future, shift). shape: the tree as
+        TreeMeasure.post() arrays instead of d (the workers recompute the outputs)."""
         from . import multigpu as MG
+        flat = (lambda: shape) if shape is not None else (lambda: MG.flatten_tree(d))
         self.st["leaves"] += 1
         if self.mode == "count":
             used = sorted({abs(l) for c in res for l in c})
@@ -375,12 +377,12 @@ class BranchSolver:
                 fut.set_result(self.cache[key])
                 self.st["leaves_cached"] += 1
             else:
-                fut = self.pool.submit(MG._w_leaf_count, res, len(used), MG.flatten_tree(d), self.count_mode,
+                fut = self.pool.submit(MG._w_leaf_count, res, len(used), flat(), self.count_mode,
                                        self.count_moduli)
             self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits, tc, self._dec),
                                  key))
         else:
-            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, MG.flatten_tree(d)), 0, lits,
+            self.pending.append((self.pool.submit(MG._w_leaf_decide, res, flat()), 0, lits,
                                  (self._depth, self._splits, tc, self._dec), None))
 
     def _drain(self, block=False, keep=0):
@@ -453,20 +455,25 @@ class BranchSolver:
         else:
             res, d, ixs, tc, sc = self._measure(lits)
             cands = _big_labels(d, ixs, self.sc_leaf if not force else max(0, sc - 3))[: self.K]
-        best = None
+        kids = []            # propagation of every child first (a failed literal returns at once) ...
         for v in cands:
-            kids = []
             for lit in (v + 1, -(v + 1)):
                 st, l2 = self._fixpoint(lits + [lit])
                 if st:
                     self.st["failed_literals"] += 1
                     st2, l3 = self._fixpoint(lits + [-lit])
                     return ("unsat", l3) if st2 else ("forced", l3)
-                tc2, sc2 = self._tcsc(l2)
-                kids.append((l2, tc2, sc2, lit))
-            score = log2sumexp2([k[1] + max(0, k[2] - self.sc_leaf) for k in kids])
+                kids.append((l2, lit))
+        if tm is not None:   # ... then the children's (tc, sc), in parallel
+            m = tm.tcsc_batch([l2 for l2, _ in kids])
+        else:
+            m = [self._tcsc(l2) for l2, _ in kids]
+        best = None
+        for i, v in enumerate(cands):
+            pair = [(kids[j][0], m[j][0], m[j][1], kids[j][1]) for j in (2 * i, 2 * i + 1)]
+            score = log2sumexp2([k[1] + max(0, k[2] - self.sc_leaf) for k in pair])
             if best is None or score < best[0]:
-                best = (score, v, kids)
+                best = (score, v, pair)
         return "branch", sorted(best[2], key=lambda k: k[1])
 
     # ------------------------------------------------------------------------------------------
@@ -544,12 +551,15 @@ class BranchSolver:
                     self._cube("xor_count")
                     break
                 if sc <= self.sc_leaf and not force:
-                    if d is None:
+                    shape = None
+                    if d is None and self.pool is not None:      # C measure: the workers only need the shape
+                        res, shape = self._tm.residual(), self._tm.post()
+                    elif d is None:
                         res, d, ixs, tc, sc = self._measure(lits)
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
                     self._cube("leaf")
                     if self.pool is not None:
-                        self._submit_leaf(res, d, lits, tc)
+                        self._submit_leaf(res, d, lits, tc, shape=shape)
                         break
                     if counting:
                         try:
