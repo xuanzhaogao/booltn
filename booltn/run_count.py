@@ -6,6 +6,7 @@ Steps: contraction order (omeco TreeSA, or --tree) -> slicing to --sc -> one com
 per prime p <= 251 (count mod p, summed over slices) -> CRT. Default stopping rule: the reconstruction is
 unchanged for 3 more primes; --rigorous uses enough primes to cover 2^n. Prints one JSON line.
 """
+import sys
 import os, json, time, math, argparse
 from .satgen import read_dimacs, sat_einsum
 from .tree_utils import complexity
@@ -14,6 +15,8 @@ from . import count_engine as CE
 
 
 def main():
+    if hasattr(sys, "set_int_max_str_digits"):
+        sys.set_int_max_str_digits(0)       # counts can have more than 4300 digits (MCC 2023 #013)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cnf", required=True)
     ap.add_argument("--sc", type=float, default=32, help="max tensor rank (bytes = 2^sc) after slicing")

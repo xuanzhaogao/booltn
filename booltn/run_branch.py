@@ -7,12 +7,15 @@ Root reductions (propagation, XOR Gauss-Jordan, cardinality LP, budgeted CDCL), 
 on the variables of the largest tensors until each branch's network fits sc_leaf, deciding the leaves on
 the GPU. Prints one JSON line (status, which component decided it, statistics).
 """
+import sys
 import argparse, json, math, os, time
 from .satgen import read_dimacs
 from .branching import BranchSolver
 
 
 def main():
+    if hasattr(sys, "set_int_max_str_digits"):
+        sys.set_int_max_str_digits(0)       # counts can have more than 4300 digits (MCC 2023 #013)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cnf", required=True)
     ap.add_argument("--sc-leaf", type=int, default=32, help="largest tensor (log2 bits) contracted at a leaf")
