@@ -238,6 +238,8 @@ class BranchSolver:
         if self.use_lp:
             self.lp = LPRelaxation(self.orig, self.n)
             self.st["lp_rows"], self.st["lp_card"] = self.lp.n_rows, self.lp.n_card
+            if self.lp.card_capped:
+                self.st["lp_card_capped"] = True
             if not self.lp.feasible(lits):
                 return self._unsat("lp")
         if self.cdcl_root:

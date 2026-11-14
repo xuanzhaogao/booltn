@@ -15,10 +15,17 @@ import sys, os, itertools, collections, math
 from .satgen import read_dimacs
 
 
-def detect(clauses, max_set=128, subset_budget=5000):
+def detect(clauses, max_set=128, subset_budget=5000, work_budget=10 ** 9, stats=None):
     """max_set caps a detected literal set; growing a set of size s by one literal checks C(s, w-1) subsets,
     which must stay <= subset_budget (w = 3: s <= 100; w = 4: 32; w = 5: 20). A fixed cap of 12 split the
-    at-most-2 constraints of tph8-10 (17-21 pigeons per hole) and left their LP feasible."""
+    at-most-2 constraints of tph8-10 (17-21 pigeons per hole) and left their LP feasible.
+    work_budget caps the k-subset rule's work (literal occurrences scanned for growth candidates plus subset
+    lookups, about 1e7 per second); past it the rule stops and the remaining clauses stay clauses (None: no
+    cap). Dense formulas need it: SGI_30_70 (SAT Competition 2026; 105 variables, 42884 clauses, every literal in
+    thousands of clauses) spent 9e9 (800 s) here and detected nothing. The most among the 258 benchmark
+    instances and the SAT Competition 2026 candidates is 2.7e8 (hcb5, 21 s), so the default 1e9 changes none.
+    stats (a dict) receives "work" and "budget_hit"."""
+    work, hit = 0, False
     cset = set(frozenset(c) for c in clauses)
     used = set()
     cons = []  # (literal list, rhs): sum of literals >= rhs  (literal -v means (1 - x_v))
@@ -28,6 +35,8 @@ def detect(clauses, max_set=128, subset_budget=5000):
         if len(c) >= 3:
             by_w[len(c)].append(c)
     for w, cls in by_w.items():
+        if hit:
+            break
         lit_clauses = collections.defaultdict(list)
         for c in cls:
             for l in c:
@@ -40,13 +49,25 @@ def detect(clauses, max_set=128, subset_budget=5000):
             grown = True
             while grown and len(L) < max_set and math.comb(len(L), w - 1) <= subset_budget:
                 grown = False
+                work += w * sum(len(lit_clauses[x]) for x in L)
+                if work_budget is not None and work > work_budget:
+                    hit = True
+                    break
                 cand = collections.Counter(l for x in L for cc in lit_clauses[x] for l in cc if l not in L)
                 for l, _ in cand.most_common():
                     if -l in L:
                         continue
-                    if all(frozenset(T) | {l} in cset for T in itertools.combinations(L, w - 1)):
+                    ok = True
+                    for T in itertools.combinations(L, w - 1):
+                        work += 1
+                        if frozenset(T) | {l} not in cset:
+                            ok = False
+                            break
+                    if ok:
                         L.add(l); grown = True
                         break
+            if hit:
+                break
             if len(L) > w:
                 covered = [frozenset(T) for T in itertools.combinations(L, w)]
                 if all(t in cset for t in covered):
@@ -77,6 +98,8 @@ def detect(clauses, max_set=128, subset_budget=5000):
                 edges_left.discard(e)
                 used.add(frozenset((-a, -b)))
             cons.append((sorted(-x for x in C), len(C) - 1))  # sum(not u) >= |C|-1  <=>  sum u <= 1 (u literals)
+    if stats is not None:
+        stats.update(work=work, budget_hit=hit)
     rest = [sorted(c) for c in cset if c not in used]
     for c in rest:
         cons.append((c, 1))

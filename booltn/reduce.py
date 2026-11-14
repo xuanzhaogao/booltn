@@ -190,8 +190,11 @@ class LPRelaxation:
         import highspy
         from .card_detect import detect
         t = time.time()
+        self.card_capped = False
         if card:
-            cons, self.absorbed = detect(clauses)
+            cst = {}
+            cons, self.absorbed = detect(clauses, stats=cst)
+            self.card_capped = cst["budget_hit"]          # detection stopped at its work budget
         else:
             cons, self.absorbed = [(sorted(c), 1) for c in set(frozenset(c) for c in clauses)], 0
         self.n_card = sum(1 for lits, rhs in cons if rhs > 1 or len(lits) > 2 and rhs == len(lits) - 1)
