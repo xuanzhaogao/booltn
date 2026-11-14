@@ -52,6 +52,13 @@ Limits:
   reductions are used there, and XOR-only nodes are counted in closed form, 2^(#vars − rank).
 * **Multi-GPU** (`--gpus k`): one worker process per GPU. Slices, #SAT prime passes and
   branch-and-reduce leaves are distributed over the workers.
+* **Distributed contraction** (`booltn.distributed`, Python API, decision only): one contraction with
+  its large tensors partitioned across 2^p GPUs, after [arXiv:2606.01852](https://arxiv.org/abs/2606.01852).
+  Each GPU holds the shard of a tensor for one value of a label; when another label becomes the better
+  one to split on, GPU pairs swap half of their shards in place. Slicing is the special case without
+  exchanges, and a planner picks between the two per tensor. On grid 3-SAT and plaquette CSP it ties
+  with slice-parallel execution of a well-sliced tree at 2 GPUs and was 1.04–1.16× faster with 8 ranks
+  (run on two H800), because slicing costs little on these networks.
 
 For better contraction orders, see the sibling package [treesa_gpu](https://github.com/xuanzhaogao/treesa_gpu). `booltn` does not
 depend on it; both use the same tree files. The research repository [booltn-gpu](https://github.com/xuanzhaogao/booltn-gpu)
@@ -118,12 +125,14 @@ labels of `sat_einsum`. Tree files hold `{"tree": ..., "sliced": [...]}` (`order
 | `reduce` | Reductions for branch-and-reduce: `CDCL` (propagation, CaDiCaL and CryptoMiniSat probes), `detect_xors` + `XorSystem` (Gauss–Jordan over GF(2)), `LPRelaxation` (HiGHS) |
 | `branching` | `BranchSolver`: root reductions, lookahead branching on the largest tensors, GPU leaves; `mode="decide"` or `"count"` |
 | `multigpu` | `GpuPool` (one process per GPU), `decide_sliced`, `count_sliced`; branch-and-reduce leaves via `BranchSolver(pool=...)` |
+| `distributed` | One contraction partitioned across 2^p GPUs: `plan_distribution` (what each tensor is split along and where GPU pairs exchange half-shards; a tree DP over the GPU time model plus a link model), `emulate` (numpy reference), `DistPlan` (execution, one library copy and one thread per GPU; needs `make -C kernels mg`) |
 
 CUDA sources (`kernels/`):
 
 | file | content |
 |---|---|
 | `booltn.cu` | Bit permutations, CUDA-core / tensor-core / small-batch contraction kernels, plans, CUDA graphs |
+| `booltn_mg.cu` | `booltn.cu` plus device binding and the in-place swap of buffer halves between two GPUs (`make mg` → `libbooltn_mg.so`, for `booltn.distributed`) |
 | `tc_gemm.cuh`, `bgemm_sm90.cuh` | 1-bit wgmma GEMM: TMA producer warp, 2 consumer warpgroups, split-K with `atomicOr` |
 | `count8.cu` | Byte permutations, dp4a / outer-product / int8 wgmma mod-p kernels |
 | `wgmma_b1.inc`, `wgmma_u8.inc` | Generated inline-PTX wrappers (`make inc` regenerates them) |
@@ -143,3 +152,7 @@ The suite covers:
 * `test_slices.py`: every slice against minisat with assumptions, for the eager path, the plan, and the CUDA graph.
 * `test_decide.py`: `decide` against minisat.
 * `test_branching.py`: branch-and-reduce against minisat, with GPU leaves and each root reducer.
+
+Run separately (not in `run_all.sh`):
+* `test_distributed_plan.py` (CPU only): the distribution planner and its numpy emulation against minisat, for 2, 4 and 8 GPUs.
+* `test_distributed.py CASE.json ... --p 1` (GPUs; `make -C kernels mg`): `DistPlan` against `CompiledTree` on every slice. `make_distributed_case.py` writes the case files.
