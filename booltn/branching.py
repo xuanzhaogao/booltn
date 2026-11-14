@@ -147,9 +147,9 @@ class BranchSolver:
                 f.write(json.dumps(dict(key=key, count=str(count))) + "\n")
 
     # ------------------------------------------------------------------------------------------
-    def _cube(self, why):
+    def _cube(self, why, **extra):
         if self.cubes is not None:
-            self.cubes.write(json.dumps(dict(dec=list(self._dec), why=why, depth=self._depth)) + "\n")
+            self.cubes.write(json.dumps(dict(dec=list(self._dec), why=why, depth=self._depth, **extra)) + "\n")
 
     def log(self, *a):
         if self.verbose:
@@ -554,7 +554,7 @@ class BranchSolver:
                     self._cube("xor_count")
                     break
                 if sc <= self.sc_leaf and not force:
-                    shape = None
+                    shape, tc0, sc0 = None, tc, sc      # the fast measure's estimate, the same in every leaf mode
                     if d is None and self.pool is not None:      # C measure: the workers only need the shape
                         res, shape = self._tm.residual(), self._tm.post()
                     elif d is None and self.leaf == "skip":      # the leaf is not decided: no tree needed
@@ -574,7 +574,7 @@ class BranchSolver:
                             stack.append((lits + [lit2], depth + 1, False, splits, dec + (lit2,)))
                         break
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
-                    self._cube("leaf")
+                    self._cube("leaf", tc=round(float(tc0), 2), sc=int(sc0))
                     if self.pool is not None:
                         self._submit_leaf(res, d, lits, tc, shape=shape)
                         break
