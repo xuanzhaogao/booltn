@@ -36,7 +36,9 @@ def read_dimacs(path):
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if not line or line[0] in "c%":
+            if line[:1] == "%":      # SATLIB marks the end of the formula with "%" (followed by a stray "0")
+                break
+            if not line or line[0] == "c":
                 continue
             if line[0] == "p":
                 n = int(line.split()[2])
