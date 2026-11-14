@@ -86,3 +86,52 @@ int btm_tcsc(int nn, const int32_t *leaf_clause, const int32_t *left, const int3
     *tc = m + log2(s);
     return nterm;
 }
+
+/* Output labels of every contraction of the restricted tree, in the order of recompute_outputs: call right
+ * after btm_tcsc with the same arguments (it reads sub, ext, eff). For each live internal node j (eff[j] == j)
+ * the labels (0-based variables) of iy(j) = first occurrences in la + lb that occur outside the subtree, where
+ * la is the clause's unassigned literals in clause order for a leaf child, else the child's iy, go to
+ * arena[off[j] .. off[j] + len[j]). stamp: n + 1 ints (work). Returns the arena size used, or -1 if it would
+ * exceed cap (call again with a larger arena).
+ */
+int btm_iy(int nn, const int32_t *leaf_clause, const int32_t *left, const int32_t *right,
+           const int32_t *cptr, const int32_t *clit, int n, const int8_t *val,
+           const uint64_t *sub, const uint64_t *ext, const int32_t *eff,
+           int32_t *off, int32_t *len, int32_t *arena, int cap, int32_t *stamp)
+{
+    const int W = n / 64 + 1;
+    int used = 0;
+    for (int v = 0; v <= n; v++) stamp[v] = -1;
+    for (int j = 0; j < nn; j++) {
+        if (leaf_clause[j] >= 0 || eff[j] != j) continue;
+        const uint64_t *e = ext + (size_t)j * W;
+        off[j] = used;
+        for (int side = 0; side < 2; side++) {
+            int a = eff[side ? right[j] : left[j]];
+            int c = leaf_clause[a];
+            if (c >= 0) {
+                for (int k = cptr[c]; k < cptr[c + 1]; k++) {
+                    int l = clit[k], v = l > 0 ? l : -l;
+                    if (val[v] != 0 || stamp[v] == j) continue;
+                    stamp[v] = j;
+                    if (e[v >> 6] >> (v & 63) & 1) {
+                        if (used >= cap) return -1;
+                        arena[used++] = v - 1;
+                    }
+                }
+            } else {
+                for (int k = off[a]; k < off[a] + len[a]; k++) {
+                    int v = arena[k] + 1;
+                    if (stamp[v] == j) continue;
+                    stamp[v] = j;
+                    if (e[v >> 6] >> (v & 63) & 1) {
+                        if (used >= cap) return -1;
+                        arena[used++] = v - 1;
+                    }
+                }
+            }
+        }
+        len[j] = used - off[j];
+    }
+    return used;
+}

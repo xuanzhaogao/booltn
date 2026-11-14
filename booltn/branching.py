@@ -197,8 +197,21 @@ class BranchSolver:
             return self._tm.tcsc(lits)
         return self._measure(lits)[3:]
 
-    def _measure(self, lits):
-        """Residual network, its tree (root tree pruned) and (tc, sc)."""
+    def _measure(self, lits, full=True):
+        """Residual network, its tree (root tree pruned) and (tc, sc); self._keep = indices of the live clauses
+        (empty: every clause satisfied). full=False with the C measure: (None, None, None, tc, sc), the residual
+        and the tree are not built (a node that branches needs neither)."""
+        tm = self._tm
+        if tm is not None and tm.has_iy():
+            tc, sc = tm.tcsc(lits)
+            self._keep = tm.keep().tolist()
+            if not self._keep:
+                return [], None, None, 0.0, 0
+            if not full:
+                return None, None, None, tc, sc
+            res = tm.residual()
+            ixs = [[abs(l) - 1 for l in c] for c in res]
+            return res, tm.tree(ixs), ixs, tc, sc
         keep, res = self._residual(lits)
         self._keep = keep
         if not res:
@@ -421,7 +434,7 @@ class BranchSolver:
             sat = False
         elif self.leaf == "gpu":
             from . import engine as E
-            sat = E.decide(res, d, [], early_exit=False)[0]
+            sat = E.decide(res, d, [], early_exit=False, outputs_ready=True)[0]
         else:   # "cdcl": exact CDCL on the residual (for testing without an H100)
             from pysat.solvers import Solver
             with Solver(name="cadical195", bootstrap_with=res) as s:
@@ -433,8 +446,13 @@ class BranchSolver:
         """Best branching variable by lookahead -> ("branch", [(lits0, tc0), (lits1, tc1)])
         or ("forced", lits') when a value fails, or ("unsat", reason) when both fail.
         force: branch even if the network already fits sc_leaf (a leaf count overflowed the CRT range)."""
-        res, d, ixs, tc, sc = self._measure(lits)
-        cands = _big_labels(d, ixs, self.sc_leaf if not force else max(0, sc - 3))[: self.K]
+        tm = self._tm
+        if tm is not None and tm.has_iy():
+            tc, sc = tm.tcsc(lits)
+            cands = tm.big_labels(self.sc_leaf if not force else max(0, sc - 3))[: self.K]
+        else:
+            res, d, ixs, tc, sc = self._measure(lits)
+            cands = _big_labels(d, ixs, self.sc_leaf if not force else max(0, sc - 3))[: self.K]
         best = None
         for v in cands:
             kids = []
@@ -495,7 +513,10 @@ class BranchSolver:
             while True:     # node loop (repeats after a failed literal)
                 t = time.time()
                 st, out = self._fixpoint(lits)
-                if st is None and self.lp is not None and (self.lp_max_depth is None or depth <= self.lp_max_depth):
+                # Without cardinality rows every LP row is an input clause; after propagation each open clause
+                # has >= 2 free literals, so x = 1/2 on the free variables is feasible: skip the solve.
+                if (st is None and self.lp is not None and self.lp.n_card > 0
+                        and (self.lp_max_depth is None or depth <= self.lp_max_depth)):
                     if not self.lp.feasible(out):
                         st, out = "UNSAT", "lp"
                 if st is None and self.cdcl_node and depth > 0:
@@ -511,8 +532,8 @@ class BranchSolver:
                     self._cube(out)
                     break
                 lits = out
-                res, d, ixs, tc, sc = self._measure(lits)
-                if not res:
+                res, d, ixs, tc, sc = self._measure(lits, full=False)
+                if not self._keep:
                     if not counting:
                         return self._finish(Result("SAT", "search", self.st))
                     total += 1 << self._nfree(lits)
@@ -523,6 +544,8 @@ class BranchSolver:
                     self._cube("xor_count")
                     break
                 if sc <= self.sc_leaf and not force:
+                    if d is None:
+                        res, d, ixs, tc, sc = self._measure(lits)
                     self.st["leaf_sc_max"] = max(self.st["leaf_sc_max"], sc)
                     self._cube("leaf")
                     if self.pool is not None:

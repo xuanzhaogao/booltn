@@ -4,7 +4,7 @@
 # `flock /tmp/booltn_gpu.lock` on a shared GPU.
 cd "$(dirname "$0")"
 fail=0
-for t in test_engine test_count_kernels test_count test_wide test_slices test_decide test_branching test_measure test_card; do
+for t in test_engine test_count_kernels test_count test_wide test_slices test_decide test_branching test_measure test_card test_xor; do
   if python $t.py > /tmp/booltn_$t.$$.log 2>&1; then echo "PASS $t"; else echo "FAIL $t (log: /tmp/booltn_$t.$$.log)"; fail=1; fi
 done
 exit $fail

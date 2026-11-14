@@ -909,19 +909,22 @@ class SatSlicer:
 # ------------------------------------------------------------------------------------------
 
 
-def decide(clauses, tree, sliced=(), small_rc=14, early_exit=True, max_slices=None, use_graph=True):
+def decide(clauses, tree, sliced=(), small_rc=14, early_exit=True, max_slices=None, use_graph=True,
+           outputs_ready=False):
     """Decide satisfiability on the GPU with a compiled plan (the fast path behind ``run_sat``).
 
     ``tree`` is an omeco-format dict for the clause network (labels = 0-based variables, as built by
     ``satgen.sat_einsum``); its internal outputs are recomputed for the network with the ``sliced``
-    variables removed. Each slice (assignment of the sliced variables) replays one CUDA graph and the
+    variables removed (outputs_ready, no slicing: ``tree`` already has the outputs of recompute_outputs over
+    the clauses' labels, as BranchSolver's restricted trees do; used as is). Each slice (assignment of the
+    sliced variables) replays one CUDA graph and the
     answer is OR-accumulated on the device. Returns ``(sat, slices_done, info)`` with
     ``info = dict(compile_s, run_s, arena_gib, nslices)``. UNSAT is only proven if all slices ran.
     """
     from .tree_utils import recompute_outputs
     sliced = list(sliced)
     slicer = SatSlicer(clauses, sliced)
-    d = recompute_outputs(tree, [list(l) for l in slicer.labels], [])
+    d = tree if outputs_ready and not sliced else recompute_outputs(tree, [list(l) for l in slicer.labels], [])
     t = time.time()
     ct = CompiledTree(d, slicer.labels, use_graph=use_graph, small_rc=small_rc)
     try:

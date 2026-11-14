@@ -1,5 +1,7 @@
-"""booltn.measure (kernels/measure.c) vs the Python tree walks of BranchSolver._measure: (tc, sc) of the root
-tree restricted to random partial assignments must be identical (tc bit for bit). CPU only."""
+"""booltn.measure (kernels/measure.c) vs the Python tree walks (BranchSolver._residual, prune_tree,
+recompute_outputs, complexity, slicer._big_labels): for the root tree restricted to random partial assignments,
+(tc, sc) must be identical (tc bit for bit), and so must the live clauses, the residual clauses, the restricted
+tree (output labels in the same order) and the branching candidates. CPU only."""
 import random
 import sys
 import time
@@ -7,6 +9,18 @@ from booltn.satgen import random_ksat
 from booltn.hard_families import tseitin_grid
 from booltn.branching import BranchSolver
 from booltn.measure import TreeMeasure, available
+from booltn.slicer import _big_labels
+from booltn.tree_utils import complexity, prune_tree, recompute_outputs
+
+
+def py_measure(bs, lits):
+    """The Python path of BranchSolver._measure: (keep, res, d, ixs, tc, sc)."""
+    keep, res = bs._residual(lits)
+    if not res:
+        return keep, res, None, None, 0.0, 0
+    ixs = [[abs(l) - 1 for l in c] for c in res]
+    d = recompute_outputs(prune_tree(bs.tree, keep), ixs, [])
+    return (keep, res, d, ixs) + complexity(d, ixs)
 
 
 def main():
@@ -28,9 +42,19 @@ def main():
         for _ in range(300):
             k = rng.choice([0, 1, 3, 10, len(vs) // 3, len(vs)])
             lits = list(bs.root_lits) + [v if rng.random() < .5 else -v for v in rng.sample(vs, min(k, len(vs)))]
-            bad += bs._measure(lits)[3:] != tm.tcsc(lits)
+            keep, res, d, ixs, tc, sc = py_measure(bs, lits)
+            bad += (tc, sc) != tm.tcsc(lits)
+            bad += keep != tm.keep().tolist()
+            if res and tm.has_iy():                # btm_iy: library built from this version
+                bad += res != tm.residual()
+                bad += d != tm.tree(ixs)
+                for tgt in {0, 3, 8, max(0, sc - 3)}:
+                    bad += _big_labels(d, ixs, tgt) != tm.big_labels(tgt)
+            m = bs._measure(lits)                    # BranchSolver's own path (C when built)
+            bad += (m[0] != res) + (m[1] != d) + (tuple(m[3:]) != (tc, sc))
         ok &= bad == 0
-        print(f"{'PASS' if bad == 0 else 'FAIL'} {name:24s} {tm.nn} tree nodes, 300 assignments, {bad} mismatches")
+        print(f"{'PASS' if bad == 0 else 'FAIL'} {name:24s} {tm.nn} tree nodes, 300 assignments, {bad} mismatches "
+              "(tc/sc, live clauses, residual, tree, candidates)")
     print("ALL PASSED" if ok else "SOME FAILED")
     sys.exit(0 if ok else 1)
 

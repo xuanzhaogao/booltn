@@ -117,6 +117,74 @@ class XorSystem:
                 break
         self.n_xors = len(xors)
         self.time = 0.0
+        self._c = None           # C state (kernels/gf2.c), built on first use; False: Python path
+
+    # largest work matrix (nx rows of nx / 64 + 1 words) for the C path; larger systems use the Python path
+    C_MAX_BYTES = 1 << 28
+
+    def _cstate(self):
+        """Root RREF as bitset arrays over the XOR variables for btx_implied (lib/libbtmeasure.so), or False
+        when the library is missing or the system is too large."""
+        if self._c is not None:
+            return self._c
+        self._c = False
+        if not self.consistent:
+            return False
+        import numpy as np
+        from .measure import _lib
+        L = _lib()
+        if not L or not hasattr(L, "btx_implied"):
+            return False
+        cols = sorted(self.vars)
+        nx = len(cols)
+        W = nx // 64 + 1
+        if nx == 0 or nx * W * 8 > self.C_MAX_BYTES:
+            return False
+        colmap = np.full(cols[-1] + 1, -1, dtype=np.int64)
+        colmap[cols] = np.arange(nx)
+        R = len(self.rows)
+        M0 = np.zeros((max(R, 1), W), dtype=np.uint64)
+        rhs0 = np.zeros(max(R, 1), dtype=np.uint8)
+        piv0 = np.zeros(max(R, 1), dtype=np.int32)
+        prow0 = np.full(nx, -1, dtype=np.int32)
+        for i, (v, (pm, pr)) in enumerate(self.rows.items()):
+            m = pm
+            while m:
+                low = m & -m
+                c = int(colmap[low.bit_length() - 1])
+                M0[i, c >> 6] |= np.uint64(1 << (c & 63))
+                m ^= low
+            rhs0[i], piv0[i], prow0[colmap[v]] = pr, colmap[v], i
+        self._c = dict(nx=nx, R=R, cols=np.array(cols, dtype=np.int64), colmap=colmap, M0=M0, rhs0=rhs0,
+                       piv0=piv0, prow0=prow0, M=np.zeros((nx, W), dtype=np.uint64),
+                       rhs=np.zeros(nx, dtype=np.uint8), piv=np.zeros(nx, dtype=np.int32),
+                       prow=np.zeros(nx, dtype=np.int32), mark=np.zeros(nx, dtype=np.uint8),
+                       tmp=np.zeros(W, dtype=np.uint64), out=np.zeros(nx, dtype=np.int32), lib=L)
+        return self._c
+
+    def _c_units(self, lits):
+        """C path: (consistent, implied literals on XOR variables not in lits, rank)."""
+        import ctypes
+        import numpy as np
+        S = self._c
+        a = np.asarray(lits, dtype=np.int64).reshape(-1)
+        v = np.abs(a) - 1
+        inr = v < len(S["colmap"])
+        c = np.full(len(a), -1, dtype=np.int64)
+        c[inr] = S["colmap"][v[inr]]
+        sel = c >= 0
+        cols = np.ascontiguousarray(c[sel], dtype=np.int32)
+        vals = np.ascontiguousarray(a[sel] > 0, dtype=np.uint8)
+        nout, nrows = ctypes.c_int32(), ctypes.c_int32()
+        p = lambda x: x.ctypes.data
+        ok = S["lib"].btx_implied(S["nx"], S["R"], p(S["M0"]), p(S["rhs0"]), p(S["piv0"]), p(S["prow0"]),
+                                  p(S["M"]), p(S["rhs"]), p(S["piv"]), p(S["prow"]), p(S["mark"]), p(S["tmp"]),
+                                  len(cols), p(cols), p(vals), p(S["out"]), ctypes.byref(nout), ctypes.byref(nrows))
+        if not ok:
+            return False, [], None
+        o = S["out"][: nout.value].astype(np.int64)
+        lits_out = np.where(o > 0, S["cols"][np.abs(o) - 1] + 1, -(S["cols"][np.abs(o) - 1] + 1))
+        return True, lits_out.tolist(), nrows.value
 
     @staticmethod
     def _add(rows, mask, rhs):
@@ -147,6 +215,10 @@ class XorSystem:
         if not self.consistent:
             return False, None
         t = time.time()
+        if self._cstate():
+            ok, _, rk = self._c_units(lits)
+            self.time += time.time() - t
+            return (True, rk) if ok else (False, None)
         rows = dict(self.rows)
         for l in lits:
             v = abs(l) - 1
@@ -162,6 +234,10 @@ class XorSystem:
         if not self.consistent:
             return False, []
         t = time.time()
+        if self._cstate():
+            ok, out, _ = self._c_units(lits)
+            self.time += time.time() - t
+            return ok, out
         rows = dict(self.rows)
         assigned = {}
         for l in lits:
