@@ -45,6 +45,7 @@ import os
 import sys
 import time
 
+from .count_engine import CountTimeout
 from .reduce import CDCL, XorSystem, LPRelaxation, detect_xors
 from .slicer import _big_labels
 from .tree_utils import recompute_outputs, complexity, prune_tree, log2sumexp2
@@ -415,7 +416,8 @@ class BranchSolver:
             return self.cache[key] << (self._nfree(lits) - len(used))
         if self.leaf == "gpu":
             from .count_engine import count_models
-            c, _ = count_models(res, len(used), d, mode=self.count_mode, primes=self.count_moduli)
+            c, _ = count_models(res, len(used), d, mode=self.count_mode, primes=self.count_moduli,
+                                deadline=self.t0 + self.time_limit)
         else:   # "cdcl": enumerate models over the used variables (tests only)
             from pysat.solvers import Minisat22
             c = 0
@@ -444,7 +446,7 @@ class BranchSolver:
                 self.st["leaves_cached"] += 1
             else:
                 fut = self.pool.submit(MG._w_leaf_count, res, len(used), flat(), self.count_mode,
-                                       self.count_moduli)
+                                       self.count_moduli, self.t0 + self.time_limit)
             self.pending.append((fut, self._nfree(lits) - len(used), lits, (self._depth, self._splits, tc, self._dec),
                                  key))
         else:
@@ -464,7 +466,7 @@ class BranchSolver:
                 break
             try:
                 r = fut.result(timeout=max(1.0, self.time_limit - (time.time() - self.t0)))
-            except cf.TimeoutError:
+            except (cf.TimeoutError, CountTimeout):
                 out = ("LIMIT", None)
                 break
             except (ValueError, MemoryError) as e:    # count beyond the moduli, or the leaf plan does not fit
@@ -645,6 +647,8 @@ class BranchSolver:
                         try:
                             total += self._leaf_count(res, d, lits)
                             break
+                        except CountTimeout:
+                            return self._finish(Result("UNKNOWN", "limit", self.st, count=None))
                         except (ValueError, MemoryError) as e:   # count beyond the moduli / plan too large: split
                             if splits >= self.max_splits:
                                 self.st["error"] = f"{e}; still too large after {splits} splits"

@@ -12,6 +12,10 @@ import ctypes, os, math, time
 import numpy as np
 from .engine import Arena, PlanTensor, plan as classify, LIB_DIR, plan_layouts
 
+
+class CountTimeout(Exception):
+    """count_models passed its deadline (between moduli or slices); the count is unknown."""
+
 _LIB = None
 IntArr = lambda xs: (ctypes.c_int * max(1, len(xs)))(*xs)
 VP = ctypes.c_void_p
@@ -430,7 +434,7 @@ class CountSlicer:
 
 
 def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=False, mode="stable", confirm=3,
-                 wide=True):
+                 wide=True, deadline=None):
     """Exact model count of a CNF over variables 1..n using a contraction tree (dict) for the einsum
     built from the clause variable lists with `sliced` variables removed. Returns (count, info).
 
@@ -439,6 +443,8 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
     mode="rigorous": use moduli until their product exceeds 2^(#used vars) (always exact).
     mode="stable"  : early-terminating CRT: stop when the reconstruction has not changed for `confirm`
                      extra moduli (error probability ~ prod 1/p_i over the confirming moduli, <= ~1e-7 for 3).
+    deadline: absolute time.time(); checked before every modulus and every 64 slices, raises CountTimeout.
+              (A count of b bits needs about b/8 passes, one per modulus, so one leaf can take long.)
     """
     from .tree_utils import recompute_outputs
     sliced = list(sliced)
@@ -498,10 +504,14 @@ def count_models(clauses, n, tree, sliced=(), primes=None, small_rc=12, verbose=
                 t_compile += time.time() - t0
                 compile_w[w] = time.time() - t0
                 arena = max(arena, ct.arena_bytes)
+            if deadline is not None and time.time() > deadline:
+                raise CountTimeout(f"deadline passed after {len(used_primes)} moduli")
             t1 = time.time()
             ct.set_prime(p)
             try:
                 for s in range(nsl):
+                    if deadline is not None and s % 64 == 63 and time.time() > deadline:
+                        raise CountTimeout(f"deadline passed in slice {s} of {nsl}")
                     ct.set_leaves(leaf_bufs[s] if leaf_bufs is not None else slicer_w.leaves(s))
                     ct.run()
                 r = ct.residue()

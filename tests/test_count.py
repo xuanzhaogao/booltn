@@ -138,5 +138,14 @@ if __name__ == "__main__":
     cl, nv = hardcore_grid(66, 10)
     for src in (12, 0):
         allok &= check(f"independent sets 66x10 (> 10^109) small_rc={src}", cl, nv, hardcore_count(66, 10), small_rc=src)
+    # a passed deadline stops the moduli loop (a count of b bits needs ~b/8 passes; MCC has counts of 8000 bits)
+    from booltn.count_engine import CountTimeout
+    try:
+        count_models(cl, nv, tree_for(cl, nv), deadline=time.time() - 1)
+        ok = False
+    except CountTimeout:
+        ok = True
+    print(f"{'PASS' if ok else 'FAIL'} deadline: CountTimeout before the first modulus", flush=True)
+    allok &= ok
     print("ALL PASSED" if allok else "SOME FAILED")
     sys.exit(0 if allok else 1)
