@@ -14,10 +14,11 @@ closed-form counts or other counters. Details and scripts: [booltn-gpu](https://
 | vs PyTorch fp16 on the same contraction trees | **36–48× faster**, 16–20× less memory |
 | Largest tensor | **2^37 bits** (16 GiB) on 80 GB; fp16 would stop at about 2^33 entries |
 | Grid 3-SAT, L = 22 / 24 (484 / 576 vars), whole instance | **20 ms / 1.27 s** at 4.6 / **7.96 POPS** |
-| Random 3-SAT n = 70, α = 4.26 (UNSAT, 512 slices) | 41.7 s; memory-bound at about 35 TOPS |
+| Random 3-SAT n = 70, α = 4.26 (UNSAT, 512 slices) | **18.8 s** (40 s before the perm4 permutes); memory-bound |
 | 81 published crafted SAT instances (sgen, chessboard, Tseitin, Urquhart, subset cardinality) | **80 solved in 0.7–16 s**, incl. instances no SAT-competition entrant solved; kissat 38, CaDiCaL 33, CryptoMiniSat 56 (900 s) |
 | #SAT on grid-structured instances that sharpSAT-TD and d4v2 could not finish in 30 min | **all counted in 1.3–25 s** (Tseitin, domino tilings, plaquette CSP, grid 3-SAT) |
 | #SAT where those CPU counters do finish | **5–700× faster**, identical counts (9/9) |
+| #SAT pass time after flexible-layout small-K GEMMs + perm4 permutes | **2.5–4.5× faster** per modulus than before (plaquette L28 f6: 18.7 → 5.1 s end to end) |
 | `booltn-branch`, 258 published crafted SAT instances (900 s) | **248 decided**; best single CPU solver (CryptoMiniSat + Gauss) 200, virtual best of six CPU methods 253; all answers agree |
 | `booltn-branch --count`, 176-instance #SAT benchmark (1800 s) | **174 counted**; sharpSAT-TD / d4v2 virtual best 137; counts up to 10^289; all 152 references agree |
 
