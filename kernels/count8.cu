@@ -842,6 +842,7 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
           const int row = r0 + 8 * h;
 #pragma unroll
           for (int s4 = 0; s4 < BN / 32; ++s4) {
+            if (tn * BN + 32 * s4 >= p.N) break;   // N = 32 < BN: a 32-column group is all in or all out (warp-uniform)
             uint32_t e[4];   // element t: columns 8(4 s4 + t) + 2q, +1 as two bytes (W = 1) or two 16-bit residues
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
