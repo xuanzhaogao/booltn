@@ -38,6 +38,8 @@ def lib():
                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         L.bt_gemm_cc.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4
         L.bt_gemm_tc.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 5
+        L.bt_gemm_ccd.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4
+        L.bt_set_cc_impl.argtypes = [ctypes.c_int]
         L.bt_contract_generic.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
                                                                    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
         L.bt_set_perm_impl.argtypes = [ctypes.c_int]
@@ -158,13 +160,19 @@ def choose_kind(Bt, Kt, Mt, Nt):
     tc : 1-bit tensor cores (K >= 7 labels, N >= 5 labels)
     tcp: tensor cores with operand rows zero-padded to 128 bits (3 <= K <= 6 labels)
     cc : CUDA-core masked-OR (any shape; N < 5 packs several rows per output word)
-    Choice = argmin of the fitted cost model.
+    ccd: CUDA-core dot products with the tc operand layouts, for tiny tiles: 6 <= K <= 10, M <= 5, N <= 6 labels
+         (measured on the H100: 2-4x faster than tc there, which pads them to 64 x 64 x 1024-bit tiles, and
+         1.2-1.5x faster than cc / tcp at K = 6)
+    Choice = argmin of the fitted cost model, except ccd (rule above; not in the fitted model).
     """
     m, n = len(Mt), len(Nt)
     swap = m > n  # put the larger free index set on the N (word-packed) side
     if swap:
         m, n = n, m
-    costs = kernel_costs(len(Bt), m, n, len(Kt))
+    k = len(Kt)
+    if 6 <= k <= 10 and m <= 5 and 5 <= n <= 6:
+        return swap, "ccd"
+    costs = kernel_costs(len(Bt), m, n, k)
     kind = min(costs, key=costs.get)
     return swap, kind
 
@@ -196,7 +204,7 @@ def contract(A, B, out_labels, timing=False, free_inputs=False, force=None):
         A, B, Mt, Nt = B, A, Nt, Mt
     kind = force or kind0
     Bt, Kt = order_shared(A.labels, B.labels, Bt, Kt)
-    if kind in ("tc", "tcp"):
+    if kind in ("tc", "tcp", "ccd"):
         Ao, Bo, Co = Kt + Mt + Bt, Kt + Nt + Bt, Nt + Mt + Bt
     elif kind == "cc":
         Ao, Bo, Co = Kt + Mt + Bt, Nt + Kt + Bt, Nt + Mt + Bt
@@ -223,6 +231,8 @@ def contract(A, B, out_labels, timing=False, free_inputs=False, force=None):
         rc = L.bt_gemm_tc(A2.ptr, B2.ptr, C.ptr, len(Bt), len(Mt), len(Nt), 7, -1)
     elif kind == "cc":
         rc = L.bt_gemm_cc(A2.ptr, B2.ptr, C.ptr, len(Bt), len(Mt), len(Nt), len(Kt))
+    elif kind == "ccd":
+        rc = L.bt_gemm_ccd(A2.ptr, B2.ptr, C.ptr, len(Bt), len(Mt), len(Nt), len(Kt))
     else:
         pa = {l: i for i, l in enumerate(A2.labels)}
         pb = {l: i for i, l in enumerate(B2.labels)}
@@ -335,6 +345,7 @@ def _setup_plan_api(L):
                                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
     L.bt_plan_cc.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
     L.bt_plan_tc.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 5
+    L.bt_plan_ccd.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
     L.bt_plan_generic.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
                                                           ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
     L.bt_plan_run.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -640,7 +651,7 @@ class CompiledTree:
             if swap:
                 A, B, Mt, Nt = B, A, Nt, Mt
             Bt, Kt = order_shared(A.labels, B.labels, Bt, Kt)
-            if kind in ("tc", "tcp"):
+            if kind in ("tc", "tcp", "ccd"):
                 Ao, Bo, Co = Kt + Mt + Bt, Kt + Nt + Bt, Nt + Mt + Bt
             elif kind == "cc":
                 Ao, Bo, Co = Kt + Mt + Bt, Nt + Kt + Bt, Nt + Mt + Bt
@@ -663,8 +674,8 @@ class CompiledTree:
                 ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
             elif kind == "tcp":
                 ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), 7))
-            elif kind == "cc":
-                ops.append(("cc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
+            elif kind in ("cc", "ccd"):
+                ops.append((kind, A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
             else:
                 pa = {l: i for i, l in enumerate(A2.labels)}
                 pb = {l: i for i, l in enumerate(B2.labels)}
@@ -679,6 +690,12 @@ class CompiledTree:
             self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), nops0, len(ops)))
             return C
 
+        def consumed(src, dst):
+            """src was permuted into dst: ops run in order on one stream and every tensor of the tree is read by
+            one contraction, so src's bytes may be reused by any later op (fewer live tensors)."""
+            if dst is not src:
+                tfree(src)
+
         def contract_planned(d, a, b):
             I, O = info[id(d)], orders[id(d)]
             A, B = (b, a) if I["swap"] else (a, b)
@@ -689,7 +706,9 @@ class CompiledTree:
             Bo = Nt + Kt + Bt if I["nfirst"] else Kt + Nt + Bt
             Co = Nt + Mt + Bt
             A2 = permute_spec(A, Ao, I["Ra"])      # identity when the producer was planned for this layout
+            consumed(A, A2)
             B2 = permute_spec(B, Bo, I["Rb"])
+            consumed(B, B2)
             if kind == "tcp":
                 kk = len(Kt)
                 dummy = [("pad", i) for i in range(7 - kk)]
@@ -704,7 +723,7 @@ class CompiledTree:
             if kind in ("tc", "tcp"):
                 ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt) if kind == "tc" else 7))
             else:
-                ops.append(("cc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
+                ops.append((kind, A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
             for t in (A2, B2):
                 if t is not A and t is not B:
                     tfree(t)
@@ -847,6 +866,9 @@ class CompiledTree:
             elif op[0] == "pad":
                 _, ioff, ooff, lrows, kk = op
                 rc = L.bt_plan_pad_rows(self.plan, B + R(ioff), B + R(ooff), lrows, kk)
+            elif op[0] == "ccd":
+                _, a, b, c, bb, mm, nn, kk = op
+                rc = L.bt_plan_ccd(self.plan, B + R(a), B + R(b), B + R(c), bb, mm, nn, kk)
             elif op[0] == "cc":
                 _, a, b, c, bb, mm, nn, kk = op
                 rc = L.bt_plan_cc(self.plan, B + R(a), B + R(b), B + R(c), bb, mm, nn, kk)

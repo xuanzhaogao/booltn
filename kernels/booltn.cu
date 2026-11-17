@@ -278,6 +278,123 @@ __global__ void __launch_bounds__(256) cc_kernel(const uint32_t* __restrict__ A,
   }
 }
 
+// cc2: cc_kernel for K <= 8 bits (KK <= 3, used with VW = 4) with few instructions per output word. A thread owns VW consecutive
+// words of C (uint4 stores when VW = 4) for 2^lrm rows m of one batch element; it loads its K x VW words of B once
+// (registers) and reads each A row (K bits) with one load. Lanes cover the word vectors of a row first, then
+// consecutive rows (rows of a thread are Q apart, Q = rows covered by a warp), so every warp store writes 128-byte
+// runs even for short rows. cc_kernel spent ~100 instructions per output word on 64-bit index math and dynamic
+// k loops and wrote short rows in 32-byte pieces (0.6-0.75 TB/s on output-heavy shapes).
+template <int KK, int VW>
+__global__ void __launch_bounds__(256) cc2_kernel(const uint32_t* __restrict__ A, const uint32_t* __restrict__ B,
+                                                  uint32_t* __restrict__ C, int bb, int mm, int nn, int lrm, int lq) {
+  constexpr int K = 1 << KK;
+  constexpr int LVW = VW == 4 ? 2 : 0;
+  const int lnw = nn - 5, nwv = lnw - LVW;     // vector-index bits
+  const int lblk = mm - lrm - lq;              // row-block bits
+  const long long total = 1ll << (bb + lblk + lq + nwv);
+  for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x; idx < total;
+       idx += (long long)gridDim.x * blockDim.x) {
+    const long long v = idx & ((1ll << nwv) - 1);
+    long long t = idx >> nwv;
+    const long long q = t & ((1ll << lq) - 1);
+    t >>= lq;
+    const long long blk = t & ((1ll << lblk) - 1);
+    const long long b = t >> lblk;
+    uint32_t Bw[K][VW];
+    const uint32_t* bp = B + (((b << KK) << lnw) + (v << LVW));
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      if constexpr (VW == 4) {
+        const uint4 x = __ldg(reinterpret_cast<const uint4*>(bp + ((long long)k << lnw)));
+        Bw[k][0] = x.x; Bw[k][1] = x.y; Bw[k][2] = x.z; Bw[k][3] = x.w;
+      } else {
+        Bw[k][0] = __ldg(bp + ((long long)k << lnw));
+      }
+    }
+    const long long row0 = (b << mm) + (blk << (lrm + lq)) + q;
+    const int nr = 1 << lrm;
+    for (int r = 0; r < nr; ++r) {
+      const long long row = row0 + ((long long)r << lq);
+      const long long x = row << KK;           // A bit index of the row
+      const uint32_t aw = __ldg(A + (x >> 5)) >> (x & 31);
+      uint32_t acc[VW];
+#pragma unroll
+      for (int u = 0; u < VW; ++u) acc[u] = 0;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        int msk;
+        asm("bfe.s32 %0, %1, %2, 1;" : "=r"(msk) : "r"(aw), "r"(k));
+#pragma unroll
+        for (int u = 0; u < VW; ++u) acc[u] |= (uint32_t)msk & Bw[k][u];
+      }
+      uint32_t* cp = C + ((row << lnw) + (v << LVW));
+      if constexpr (VW == 4) *reinterpret_cast<uint4*>(cp) = make_uint4(acc[0], acc[1], acc[2], acc[3]);
+      else *cp = acc[0];
+    }
+  }
+}
+
+// ccd: batched GEMM with tiny tiles (few rows M, one or a few output words N) on CUDA cores, dot-product form:
+// C[b][m][n] = OR_k A[b][m][k] & B[b][n][k] with K-major A and B like the tensor-core kernel (K = 2^kk bits,
+// 32..1024). A warp owns one batch element and one output word column (32 n): each lane keeps its B row (KW
+// words) in registers, ANDs it with every A row (broadcast loads), and one ballot per row gives the output word.
+// The tensor-core kernel pads such shapes to 64 x 64 x 1024-bit tiles (B=23 M=4 N=5 K=8: 0.63 TB/s).
+template <int LKW>
+__device__ __forceinline__ void ccd_load(const uint32_t* p, uint32_t (&r)[1 << LKW]) {
+  constexpr int KW = 1 << LKW;
+#pragma unroll
+  for (int q = 0; q < KW; q += (KW >= 4 ? 4 : KW)) {
+    if constexpr (KW >= 4) {
+      const uint4 x = __ldg(reinterpret_cast<const uint4*>(p + q));
+      r[q] = x.x; r[q + 1] = x.y; r[q + 2] = x.z; r[q + 3] = x.w;
+    } else if constexpr (KW == 2) {
+      const uint2 x = __ldg(reinterpret_cast<const uint2*>(p));
+      r[0] = x.x; r[1] = x.y;
+    } else {
+      r[0] = __ldg(p);
+    }
+  }
+}
+
+template <int LKW>
+__global__ void __launch_bounds__(256) ccd_kernel(const uint32_t* __restrict__ A, const uint32_t* __restrict__ B,
+                                                  uint32_t* __restrict__ C, int bb, int mm, int nn) {
+  constexpr int KW = 1 << LKW;
+  const int lane = threadIdx.x & 31;
+  const int lnw = nn - 5;
+  const long long nwarps = 1ll << (bb + lnw);
+  const int M = 1 << mm;
+  const long long wstride = ((long long)gridDim.x * blockDim.x) >> 5;
+  long long wi = (blockIdx.x * (long long)blockDim.x + threadIdx.x) >> 5;
+  // the lane's B row of warp item x
+  auto brow = [&](long long x) {
+    const long long w = x & ((1ll << lnw) - 1), b = x >> lnw;
+    return B + ((((b << nn) + (w << 5) + lane)) << LKW);
+  };
+  for (; wi < nwarps; wi += wstride) {
+    const long long w = wi & ((1ll << lnw) - 1), b = wi >> lnw;
+    uint32_t br[KW];
+    ccd_load<LKW>(brow(wi), br);
+    const uint32_t* ap = A + ((b << mm) << LKW);
+    uint32_t* cp = C + ((b << mm) << lnw) + w;
+    uint32_t mine = 0;
+#pragma unroll 4
+    for (int m = 0; m < M; ++m) {
+      uint32_t ar[KW];
+      ccd_load<LKW>(ap + ((long long)m << LKW), ar);
+      uint32_t t = 0;
+#pragma unroll
+      for (int q = 0; q < KW; ++q) t |= ar[q] & br[q];
+      const uint32_t word = __ballot_sync(0xffffffffu, t != 0);
+      if (lane == (m & 31)) mine = word;
+      if ((m & 31) == 31 || m == M - 1) {   // lanes 0 .. (m & 31) store rows (m & ~31) + lane
+        const int m0 = m & ~31;
+        if (lane <= (m & 31)) cp[(long long)(m0 + lane) << lnw] = mine;
+      }
+    }
+  }
+}
+
 // CUDA-core masked-OR GEMM for small N (nn < 5): each output word packs R = 2^(5-nn) consecutive global rows
 // (row g = b*M + m). If M < R a word spans RB = R/M batch elements, each with its own B row.
 // Layouts as cc_kernel: A [b][m][k], B [b][k][n] (sub-word rows), C [b][m][n]. Works for any mm >= 0.
@@ -666,11 +783,12 @@ static long long grid_for(long long work, int per_block = 256) {
 }
 
 static int g_perm4_maxts = 18, g_perm4_gridmul = 1;
+static int g_cc_impl = 2;    // 2: cc2 for K <= 8 bits and rows of >= 4 words, 1: cc_kernel only
 static int g_perm_impl = 4;  // 4 = perm4 (perm4.cuh) when applicable, else perm2 / gather; 2 = perm2; 1 = gather only
 
 // One prepared kernel launch (all host-side planning done at construction).
 struct Op {
-  int kind = 0;  // 1 perm (gather), 2 perm2 (tiled), 3 cc, 4 tc, 5 generic, 11 perm4 (tiled, perm4.cuh)
+  int kind = 0;  // 1 perm (gather), 2 perm2 (tiled), 3 cc, 4 tc, 5 generic, 11 perm4 (tiled, perm4.cuh), 12 cc2, 13 ccd
   const uint32_t* a = nullptr;
   const uint32_t* b = nullptr;
   uint32_t* c = nullptr;
@@ -681,7 +799,8 @@ struct Op {
   TcLaunch tc;
   long long grid = 1;
   int bb = 0, mm = 0, nn = 0, kk = 0;
-  int lks = 0;              // log2 split-K factor (cc/ccs/tc); output pre-zeroed when > 0
+  int lks = 0;              // log2 split-K factor (cc/ccs/tc); output pre-zeroed when > 0 (cc2: log2 rows per thread)
+  int vw = 1, lq = 0;       // cc2: words per thread, log2 rows covered by the lanes of a warp
   size_t c_bytes = 0;
 
   int launch(cudaStream_t st) const {
@@ -700,6 +819,25 @@ struct Op {
           default: perm2_kernel<5><<<(int)grid, 256, 0, st>>>(a, c, *p2); break;
         }
         break;
+      case 13:
+        switch (kk) {
+          case 5: ccd_kernel<0><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+          case 6: ccd_kernel<1><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+          case 7: ccd_kernel<2><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+          case 8: ccd_kernel<3><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+          case 9: ccd_kernel<4><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+          default: ccd_kernel<5><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn); break;
+        }
+        break;
+      case 12: {
+        switch (kk) {
+          case 0: cc2_kernel<0, 4><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn, lks, lq); break;
+          case 1: cc2_kernel<1, 4><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn, lks, lq); break;
+          case 2: cc2_kernel<2, 4><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn, lks, lq); break;
+          default: cc2_kernel<3, 4><<<(int)grid, 256, 0, st>>>(a, b, c, bb, mm, nn, lks, lq); break;
+        }
+        break;
+      }
       case 3: {
         if (lks) BT_CHECK(cudaMemsetAsync(c, 0, c_bytes, st));
         dim3 g((unsigned)grid, 1u << lks);
@@ -804,11 +942,35 @@ static int make_cc(Op& op, const uint32_t* A, const uint32_t* B, uint32_t* C, in
     op.grid = grid_for(threads);
     return 0;
   }
+  if (kk <= 3 && nn >= 7 && g_cc_impl == 2) {
+    // cc2: 4-word vectors (rows of >= 4 words; K <= 8 bits: the B vectors stay in registers). Shorter rows: the
+    // older cc_kernel was as fast (B rows of one word are broadcast loads there too)
+    op.kind = 12;
+    const int lnw = nn - 5;
+    op.vw = 4;
+    const int nwv = lnw - (op.vw == 4 ? 2 : 0);
+    op.lq = std::min(std::max(0, 5 - nwv), mm);           // lanes beyond the row's vectors take rows
+    op.lks = std::min(mm - op.lq, kk <= 3 ? 3 : 1);       // rows per thread share the B words
+    // keep enough threads: fewer rows per thread on small outputs
+    while (op.lks > 0 && (1ll << (bb + mm - op.lks + nwv)) < (1ll << 17)) --op.lks;
+    op.grid = grid_for(1ll << (bb + mm - op.lks + nwv));
+    return 0;
+  }
   op.kind = 3;
   long long rows = mm >= 2 ? ((1ll << mm) + 3) / 4 : (1ll << mm);
   long long threads = (1ll << bb) * rows * (1ll << (nn - 5));
   op.lks = choose_lks(threads, kk);
   op.grid = grid_for(threads);
+  return 0;
+}
+
+// ccd (see ccd_kernel): K-major A [b][m][k], B [b][n][k] like tc; 5 <= kk <= 10, nn >= 5
+static int make_ccd(Op& op, const uint32_t* A, const uint32_t* B, uint32_t* C, int bb, int mm, int nn, int kk) {
+  if (kk < 5 || kk > 10 || nn < 5) return -3;
+  op.kind = 13;
+  op.a = A; op.b = B; op.c = C;
+  op.bb = bb; op.mm = mm; op.nn = nn; op.kk = kk;
+  op.grid = grid_for(32ll << (bb + nn - 5));
   return 0;
 }
 
@@ -943,6 +1105,7 @@ int bt_fill_random(uint32_t* p, long long nwords, unsigned seed, int and_rounds)
 }
 
 int bt_set_perm_impl(int v) { g_perm_impl = v; return 0; }
+int bt_set_cc_impl(int v) { g_cc_impl = v; return 0; }
 int bt_set_perm4_maxts(int v) { g_perm4_maxts = v; return 0; }
 int bt_set_perm4_gridmul(int v) { g_perm4_gridmul = v; return 0; }
 
@@ -965,6 +1128,11 @@ int bt_permute(const uint32_t* in, int rin, uint32_t* out, int rout, const int* 
 int bt_gemm_cc(const uint32_t* A, const uint32_t* B, uint32_t* C, int bb, int mm, int nn, int kk) {
   Op op;
   int rc = make_cc(op, A, B, C, bb, mm, nn, kk);
+  return rc ? rc : op.launch(g_stream);
+}
+int bt_gemm_ccd(const uint32_t* A, const uint32_t* B, uint32_t* C, int bb, int mm, int nn, int kk) {
+  Op op;
+  int rc = make_ccd(op, A, B, C, bb, mm, nn, kk);
   return rc ? rc : op.launch(g_stream);
 }
 int bt_gemm_tc(const uint32_t* A, const uint32_t* B, uint32_t* C, int bb, int mm, int nn, int kk, int cfg) {
@@ -1001,6 +1169,13 @@ int bt_plan_cc(void* h, const uint32_t* A, const uint32_t* B, uint32_t* C, int b
   Plan* P = (Plan*)h;
   P->ops.emplace_back();
   int rc = make_cc(P->ops.back(), A, B, C, bb, mm, nn, kk);
+  if (rc) P->ops.pop_back();
+  return rc;
+}
+int bt_plan_ccd(void* h, const uint32_t* A, const uint32_t* B, uint32_t* C, int bb, int mm, int nn, int kk) {
+  Plan* P = (Plan*)h;
+  P->ops.emplace_back();
+  int rc = make_ccd(P->ops.back(), A, B, C, bb, mm, nn, kk);
   if (rc) P->ops.pop_back();
   return rc;
 }

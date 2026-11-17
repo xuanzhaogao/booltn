@@ -105,6 +105,12 @@ if __name__ == "__main__":
         (2, 1, 2, 14, 0, 0, "cc"), (1, 0, 5, 14, 0, 0, "cc"), (1, 2, 6, 13, 0, 0, "cc"), (0, 3, 3, 16, 0, 0, "cc"),
         (0, 6, 7, 15, 0, 0, "tc"), (1, 6, 5, 14, 0, 0, "tc"), (0, 7, 8, 13, 0, 0, "tc"),
         (1, 6, 8, 6, 0, 0, "tcp"), (2, 5, 7, 5, 0, 0, "tcp"), (0, 7, 9, 4, 0, 0, "tcp"), (1, 3, 6, 3, 0, 0, "tcp"),
+        # cc2 (cc with K <= 3 labels, N >= 7 labels): short rows (rows spread over lanes), several rows per thread
+        (2, 4, 7, 2, 0, 0, "cc"), (1, 6, 9, 3, 0, 0, "cc"), (3, 0, 8, 0, 0, 0, "cc"), (0, 7, 10, 1, 0, 0, "cc"),
+        (2, 1, 12, 3, 0, 0, "cc"), (4, 3, 7, 1, 0, 0, "cc"),
+        # ccd (tiny tiles, dot products): K = 32 .. 1024 bits, M up to 128 rows (several 32-row store chunks)
+        (2, 3, 5, 6, 0, 0, "ccd"), (1, 5, 6, 8, 0, 0, "ccd"), (0, 0, 5, 5, 0, 0, "ccd"), (3, 2, 5, 10, 0, 0, "ccd"),
+        (1, 6, 6, 7, 0, 0, "ccd"), (0, 7, 7, 9, 0, 0, "ccd"), (4, 4, 5, 8, 1, 0, None),
     ]
     for i, (nb, nm, nn, nk, ra, rbb, f) in enumerate(cases):
         allok &= check(nb, nm, nn, nk, ra, rbb, force=f, seed=i)
