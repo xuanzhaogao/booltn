@@ -374,10 +374,11 @@ class BranchSolver:
                 cands.append(omeco.optimize_code(ixs, [], sizes, opt).to_dict())
             if self.order in ("gpu", "best"):
                 # GPU TreeSA (optional package treesa_gpu): on grid 3-SAT L30 a3.0 at sc target 34 it gives sc 50,
-                # tc 2^65.7 vs omeco's sc 53, tc 2^73.4
+                # tc 2^65.7 vs omeco's sc 53, tc 2^73.4; reporting the lowest-sc snapshot of the run (select="sc")
+                # instead of omeco's tc-dominated score: sc 46 (L30 a3.0) and 40 (L30 a2.5) in every run, vs 47-51 / 42-47
                 import treesa_gpu
                 g, _ = treesa_gpu.optimize(ixs, [], nchains=1024, niters=50, sc_target=self.sc_leaf, sc_weight=4.0,
-                                           mode="tc")
+                                           mode="tc", select="sc")
                 cands.append(g)
             cands = [recompute_outputs(c, ixs, []) for c in cands]
             # lowest sc first: the leaves needed grow with sc - sc_leaf (grid L26 a2.5: 24 leaves from an sc-40
