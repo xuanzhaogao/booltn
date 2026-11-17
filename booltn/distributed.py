@@ -531,8 +531,8 @@ class Program:
             C = talloc(Co)
             if kind in ("tc", "tcp"):
                 ops.append(("tc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt) if kind == "tc" else 7))
-            else:
-                ops.append(("cc", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
+            else:   # "cc" or "ccd" (tc operand layouts, CUDA cores)
+                ops.append((kind, A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt)))
             for t in (A2, B2):
                 if t is not A and t is not B:
                     tfree(t)
@@ -731,6 +731,9 @@ class _Rank:
                 elif op[0] == "pad":
                     _, ioff, ooff, lrows, kk = op
                     r = L.bt_plan_pad_rows(P, B + ioff, B + ooff, lrows, kk)
+                elif op[0] == "ccd":
+                    _, a, b, c, bb, mm, nn, kk = op
+                    r = L.bt_plan_ccd(P, B + a, B + b, B + c, bb, mm, nn, kk)
                 else:
                     _, a, b, c, bb, mm, nn, kk = op
                     r = L.bt_plan_cc(P, B + a, B + b, B + c, bb, mm, nn, kk)
