@@ -72,6 +72,57 @@ def gemm_test(kind, bb, mm, nn, kk, prime, seed=0, w=1):
     return ok
 
 
+def ccog_test(bb, mm, nn, kk, prime, seed=0, w=1):
+    """ccog (ccov with A, B, C in random label orders; the lowest LNV positions of B and C are N labels 0..LNV-1)."""
+    rng = np.random.default_rng(seed)
+    lnv = {16: 4, 8: 3, 4: 2}[(16 if kk <= 3 else 8) if w == 1 else (8 if kk <= 3 else 4)]
+    Bl = [("b", i) for i in range(bb)]; Ml = [("m", i) for i in range(mm)]
+    Nl = [("n", i) for i in range(nn)]; Kl = [("k", i) for i in range(kk)]
+    def shuffled(xs):
+        xs = list(xs); rng.shuffle(xs); return xs
+    LA = shuffled(Kl + Ml + Bl)
+    LB = Nl[:lnv] + shuffled(Nl[lnv:] + Kl + Bl)
+    LC = Nl[:lnv] + shuffled(Nl[lnv:] + Ml + Bl)
+    vals = {}
+    def tensor(labels):
+        x = rng.integers(0, prime, size=(2,) * len(labels), dtype=np.int64)   # axis i <-> labels[i]
+        if seed % 2 == 1:
+            x[...] = prime - 1
+        return x
+    lA, lB = Bl + Ml + Kl, Bl + Kl + Nl          # logical axis orders
+    A = tensor(lA); Bm = tensor(lB)
+    allL = sorted(set(lA) | set(lB), key=str)
+    letter = {l: chr(97 + i) for i, l in enumerate(allL)}
+    lC = Bl + Ml + Nl
+    spec = "".join(letter[l] for l in lA) + "," + "".join(letter[l] for l in lB) + "->" + "".join(letter[l] for l in lC)
+    want = np.einsum(spec, A, Bm) % prime
+    def to_dev(x, logical, layout):
+        # device position p <-> layout[p] (p = 0 fastest): C-order flatten with axes layout[r-1], ..., layout[0]
+        ax = [logical.index(l) for l in layout[::-1]]
+        return np.transpose(x, ax).reshape(-1) if layout else x.reshape(-1)
+    pA = dev_w(to_dev(A, lA, LA), w); pB = dev_w(to_dev(Bm, lB, LB), w)
+    pC = L.c8_malloc(max(4, (1 << (bb + mm + nn)) * w))
+    pp = L.c8_malloc(4)
+    pv = np.array([prime], dtype=np.int32); L.c8_h2d(pp, pv.ctypes.data, 4, -1)
+    pos = []
+    for l in Bl: pos += [LA.index(l), LB.index(l), LC.index(l)]
+    for l in Ml: pos += [LA.index(l), LC.index(l)]
+    for l in Nl: pos += [LB.index(l), LC.index(l)]
+    for l in Kl: pos += [LA.index(l), LB.index(l)]
+    plan = L.c8_plan_new_w(w)
+    rc = L.c8_plan_ccog(plan, pA, pB, pC, bb, mm, nn, kk, CE.IntArr(pos), pp)
+    assert rc == 0, rc
+    assert L.c8_plan_run(plan, -1, 0) == 0
+    L.c8_sync_all()
+    got = host_w(pC, 1 << (bb + mm + nn), w)
+    ok = np.array_equal(got, to_dev(want, lC, LC))
+    print(f"{'PASS' if ok else 'FAIL'} ccog     w={w} B={bb} M={mm} N={nn} K={kk} p={prime}", flush=True)
+    for q in (pA, pB, pC, pp):
+        L.c8_free(q)
+    L.c8_plan_free(plan)
+    return ok
+
+
 def perm_test(r, nred, prime, seed=0, w=1):
     rng = np.random.default_rng(seed)
     x = rng.integers(0, prime, size=(2,) * r, dtype=np.int64)  # axis order: slowest..fastest = label r-1..0
@@ -124,6 +175,9 @@ if __name__ == "__main__":
             ok &= gemm_test("cco", bb, mm, nn, kk, p, seed=sd)
             ok &= gemm_test("cco", bb, mm, nn, kk, (65521, 65519, 40009, 257)[sd % 4], seed=sd, w=2)
     L.c8_set_cco_impl(2)
+    for bb, mm, nn, kk, p, sd in CCO_MORE + [(2, 3, 9, 2, 251, 2), (1, 2, 7, 4, 241, 4), (0, 6, 6, 1, 256, 7)]:
+        ok &= ccog_test(bb, mm, nn, kk, p, seed=sd)
+        ok &= ccog_test(bb, mm, nn, kk, (65521, 65519, 40009, 257)[sd % 4], seed=sd, w=2)
     for args in [(10, 0, 251), (12, 2, 241), (8, 3, 97), (14, 0, 251), (6, 1, 5), (20, 0, 251), (16, 0, 13), (9, 0, 7)]:
         ok &= perm_test(*args)
     # 16-bit residues in byte planes (width 2); odd seeds use all entries p - 1

@@ -285,6 +285,43 @@ __device__ __forceinline__ void ld_arow(const uint8_t* a, uint32_t (&w)[KK >= 2 
   else { const uint4 v = __ldg(reinterpret_cast<const uint4*>(a)); w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w; }
 }
 
+// one output row of ccov / ccog: o[w][q] = NV output bytes (plane w) from the A row words a and the transposed B
+template <int KK, int NV, int W>
+__device__ __forceinline__ void ccov_row(const uint32_t (&a)[W][KK >= 2 ? (1 << KK) / 4 : 1],
+                                         const uint32_t (&T)[W][KK >= 2 ? (1 << KK) / 4 : 1][NV], uint32_t p,
+                                         uint32_t mb, uint32_t (&o)[W][NV / 4]) {
+  constexpr int KB = KK >= 2 ? (1 << KK) / 4 : 1, NW = NV / 4;
+#pragma unroll
+  for (int q = 0; q < NW; ++q) {
+#pragma unroll
+    for (int w = 0; w < W; ++w) o[w][q] = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int n = 4 * q + j;
+      uint32_t v;
+      if constexpr (W == 1) {
+        uint32_t s = 0;
+#pragma unroll
+        for (int kb = 0; kb < KB; ++kb) s = __dp4a(a[0][kb], T[0][kb][n], s);
+        v = modp(s, p, mb);
+      } else {
+        uint32_t s00 = 0, s01 = 0, s10 = 0, s11 = 0;
+#pragma unroll
+        for (int kb = 0; kb < KB; ++kb) {
+          s00 = __dp4a(a[0][kb], T[0][kb][n], s00); s01 = __dp4a(a[0][kb], T[1][kb][n], s01);
+          s10 = __dp4a(a[1][kb], T[0][kb][n], s10); s11 = __dp4a(a[1][kb], T[1][kb][n], s11);
+        }
+        // plane sums <= 16 * 255^2 < 2^20, so (v << 8) + s01 + s10 < 2^25: three reductions
+        v = modp(s11, p, mb);
+        v = modp((v << 8) + s01 + s10, p, mb);
+        v = modp((v << 8) + s00, p, mb);
+      }
+      o[0][q] |= (v & 0xffu) << (8 * j);
+      if constexpr (W == 2) o[1][q] |= (v >> 8) << (8 * j);
+    }
+  }
+}
+
 template <int KK, int NV, int W>
 __global__ void __launch_bounds__(256) ccov_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
                                                    uint8_t* __restrict__ C, const int* __restrict__ pp, int bb, int mm,
@@ -328,37 +365,109 @@ __global__ void __launch_bounds__(256) ccov_kernel(const uint8_t* __restrict__ A
 #pragma unroll
       for (int w = 0; w < W; ++w) ld_arow<KK>(A + (w ? psa : 0) + (row << KK), a[w]);
       uint32_t o[W][NW];
-#pragma unroll
-      for (int q = 0; q < NW; ++q) {
-#pragma unroll
-        for (int w = 0; w < W; ++w) o[w][q] = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const int n = 4 * q + j;
-          uint32_t v;
-          if constexpr (W == 1) {
-            uint32_t s = 0;
-#pragma unroll
-            for (int kb = 0; kb < KB; ++kb) s = __dp4a(a[0][kb], T[0][kb][n], s);
-            v = modp(s, p, mb);
-          } else {
-            uint32_t s00 = 0, s01 = 0, s10 = 0, s11 = 0;
-#pragma unroll
-            for (int kb = 0; kb < KB; ++kb) {
-              s00 = __dp4a(a[0][kb], T[0][kb][n], s00); s01 = __dp4a(a[0][kb], T[1][kb][n], s01);
-              s10 = __dp4a(a[1][kb], T[0][kb][n], s10); s11 = __dp4a(a[1][kb], T[1][kb][n], s11);
-            }
-            // plane sums <= 16 * 255^2 < 2^20, so (v << 8) + s01 + s10 < 2^25: three reductions
-            v = modp(s11, p, mb);
-            v = modp((v << 8) + s01 + s10, p, mb);
-            v = modp((v << 8) + s00, p, mb);
-          }
-          o[0][q] |= (v & 0xffu) << (8 * j);
-          if constexpr (W == 2) o[1][q] |= (v >> 8) << (8 * j);
-        }
-      }
+      ccov_row<KK, NV, W>(a, T, p, mb, o);
 #pragma unroll
       for (int w = 0; w < W; ++w) st_vec<NV>(C + (w ? psc : 0) + (row << nn) + (nch << LNV), o[w]);
+    }
+  }
+}
+
+// ccog: ccov on operands and output in any label order, so the permutes around it can be dropped. Every element
+// offset is linear in the label bits: idx bits (n-chunk, m-block, batch) -> per-bit offsets tA / tB / tC, row bits
+// -> rA / rC, k bits -> kA / kB. Only the NV-byte vectors are fixed: the lowest LNV positions of B and C hold the
+// N labels 0..LNV-1 in order. Lane bits of idx are summed once per thread; the remaining (warp-uniform) bits by a
+// warp shuffle sum per iteration. A rows are word loads if A's K labels are its lowest positions, else byte loads.
+struct CcogParams {
+  int nidx;               // idx bits: [n-chunk (nn - LNV) | m-block (mm - lmb) | batch (bb)]
+  int lmb;                // rows per thread = 2^lmb (M labels 0 .. lmb-1)
+  int a_kfast;
+  long long tA[40], tB[40], tC[40];
+  long long rA[4], rC[4];
+  long long kA[4], kB[4];
+  long long psa, psb, psc;  // W = 2: plane strides
+};
+
+template <int KK, int NV, int W>
+__global__ void __launch_bounds__(256) ccog_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                   uint8_t* __restrict__ C, const int* __restrict__ pp,
+                                                   const __grid_constant__ CcogParams P) {
+  constexpr int K = 1 << KK, KB = KK >= 2 ? K / 4 : 1, NW = NV / 4;
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  const int lane = threadIdx.x & 31;
+  const long long total = 1ll << P.nidx;
+  long long lA = 0, lB = 0, lC = 0;
+  for (int j = 0; j < 5 && j < P.nidx; ++j)
+    if ((lane >> j) & 1) { lA += P.tA[j]; lB += P.tB[j]; lC += P.tC[j]; }
+  const bool has = lane + 5 < P.nidx;
+  const long long mA = has ? P.tA[lane + 5] : 0, mB = has ? P.tB[lane + 5] : 0, mC = has ? P.tC[lane + 5] : 0;
+  const long long stride = (long long)gridDim.x * blockDim.x;
+  for (long long wb = blockIdx.x * (long long)blockDim.x + (threadIdx.x & ~31); wb < total; wb += stride) {
+    const long long hi = wb >> 5;
+    const bool sel = (hi >> lane) & 1;
+    long long oA = sel ? mA : 0, oB = sel ? mB : 0, oC = sel ? mC : 0;
+#pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) {
+      oA += __shfl_xor_sync(0xffffffff, oA, d);
+      oB += __shfl_xor_sync(0xffffffff, oB, d);
+      oC += __shfl_xor_sync(0xffffffff, oC, d);
+    }
+    if (wb + lane >= total) continue;
+    oA += lA; oB += lB; oC += lC;
+    uint32_t T[W][KB][NV];
+#pragma unroll
+    for (int w = 0; w < W; ++w) {
+      const uint8_t* bp = B + (w ? P.psb : 0) + oB;
+#pragma unroll
+      for (int kb = 0; kb < KB; ++kb) {
+        uint32_t x[4][NW];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int k = 4 * kb + i;
+          if (k < K) {
+            long long ko = 0;
+#pragma unroll
+            for (int t = 0; t < KK; ++t)
+              if ((k >> t) & 1) ko += P.kB[t];
+            ld_vec<NV>(bp + ko, x[i]);
+          } else {
+#pragma unroll
+            for (int q = 0; q < NW; ++q) x[i][q] = 0;
+          }
+        }
+#pragma unroll
+        for (int q = 0; q < NW; ++q)
+          transpose4x4(x[0][q], x[1][q], x[2][q], x[3][q], T[w][kb][4 * q], T[w][kb][4 * q + 1], T[w][kb][4 * q + 2],
+                       T[w][kb][4 * q + 3]);
+      }
+    }
+    const int nrows = 1 << P.lmb;
+    for (int r = 0; r < nrows; ++r) {
+      long long ra = 0, rc = 0;
+      for (int t = 0; t < P.lmb; ++t)
+        if ((r >> t) & 1) { ra += P.rA[t]; rc += P.rC[t]; }
+      uint32_t a[W][KB];
+#pragma unroll
+      for (int w = 0; w < W; ++w) {
+        const uint8_t* ap = A + (w ? P.psa : 0) + oA + ra;
+        if (P.a_kfast) {
+          ld_arow<KK>(ap, a[w]);
+        } else {
+#pragma unroll
+          for (int kb = 0; kb < KB; ++kb) a[w][kb] = 0;
+#pragma unroll
+          for (int k = 0; k < K; ++k) {
+            long long ko = 0;
+#pragma unroll
+            for (int t = 0; t < KK; ++t)
+              if ((k >> t) & 1) ko += P.kA[t];
+            a[w][k / 4] |= (uint32_t)__ldg(ap + ko) << (8 * (k % 4));
+          }
+        }
+      }
+      uint32_t o[W][NW];
+      ccov_row<KK, NV, W>(a, T, p, mb, o);
+#pragma unroll
+      for (int w = 0; w < W; ++w) st_vec<NV>(C + (w ? P.psc : 0) + oC + rc, o[w]);
     }
   }
 }
@@ -866,7 +975,7 @@ static int ccov_nv(int kk, int W) {
 }
 
 struct Op {
-  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4, 9 ccov
+  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4, 9 ccov, 10 ccog
   int W = 1;     // element width (bytes per residue, in byte planes)
   long long psa = 0, psb = 0, psc = 0;  // W = 2: plane strides of the operands / output
   const uint8_t* a = nullptr;
@@ -877,6 +986,7 @@ struct Op {
   std::unique_ptr<Perm8Params> perm;
   std::unique_ptr<Perm8TParams> permt;
   std::unique_ptr<p4::Launch> p4l;   // kind 8: byte permutation as a bit permutation (perm4.cuh)
+  std::unique_ptr<CcogParams> cg;    // kind 10: ccog
   Tc8Launch tc;
   long long grid = 1;
   int bb = 0, mm = 0, nn = 0, kk = 0, lks = 0;
@@ -925,6 +1035,23 @@ struct Op {
         if (W == 1) cco8_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk);
         else cco16_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk, psa, psb, psc);
         break;
+      case 10: {
+        const int nv = ccov_nv(kk, W);
+#define CCOG(KKk) \
+  if (W == 1) { if (nv == 16) ccog_kernel<KKk, 16, 1><<<(int)grid, 256, 0, st>>>(a, b, c, pp, *cg); \
+                else ccog_kernel<KKk, 8, 1><<<(int)grid, 256, 0, st>>>(a, b, c, pp, *cg); } \
+  else { if (nv == 8) ccog_kernel<KKk, 8, 2><<<(int)grid, 256, 0, st>>>(a, b, c, pp, *cg); \
+         else ccog_kernel<KKk, 4, 2><<<(int)grid, 256, 0, st>>>(a, b, c, pp, *cg); }
+        switch (kk) {
+          case 0: CCOG(0); break;
+          case 1: CCOG(1); break;
+          case 2: CCOG(2); break;
+          case 3: CCOG(3); break;
+          default: CCOG(4); break;
+        }
+#undef CCOG
+        break;
+      }
       case 9: {
         const int nv = ccov_nv(kk, W);
 #define CCOV(KKk) \
@@ -1196,6 +1323,47 @@ int c8_plan_cco(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb,
     while (op.lks > 0 && (1ll << (bb + mm - op.lks + nn - lnv)) < (1ll << 16)) --op.lks;
     op.grid = grid_for(1ll << (bb + mm - op.lks + nn - lnv));
   }
+  return 0;
+}
+
+// ccov with operands / output in any layout. pos = [batch labels: (pos in A, B, C) x bb | M labels: (A, C) x mm |
+// N labels: (B, C) x nn | K labels: (A, B) x kk]; N labels 0 .. LNV-1 must sit at positions 0 .. LNV-1 of B and of C
+// (LNV = log2 ccov_nv(kk, W)), else -5.
+int c8_plan_ccog(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb, int mm, int nn, int kk,
+                 const int* pos, const int* pp) {
+  if (kk > 4) return -3;
+  Plan* P = (Plan*)h;
+  const int nv = ccov_nv(kk, P->W), lnv = nv == 16 ? 4 : nv == 8 ? 3 : 2;
+  if (nn < lnv) return -3;
+  const int* bp = pos; const int* mp = pos + 3 * bb; const int* np = mp + 2 * mm; const int* kp = np + 2 * nn;
+  for (int i = 0; i < lnv; ++i)
+    if (np[2 * i] != i || np[2 * i + 1] != i) return -5;
+  int lmb = std::min(mm, 4);
+  while (lmb > 0 && (1ll << (bb + mm - lmb + nn - lnv)) < (1ll << 16)) --lmb;
+  const int nidx = (nn - lnv) + (mm - lmb) + bb;
+  if (nidx > 37) return -3;
+  P->ops.emplace_back();
+  Op& op = P->ops.back();
+  op.kind = 10;
+  op.a = A; op.b = B; op.c = C; op.pp = pp;
+  op.bb = bb; op.mm = mm; op.nn = nn; op.kk = kk;
+  op.W = P->W;
+  op.cg.reset(new CcogParams);
+  CcogParams& G = *op.cg;
+  memset(&G, 0, sizeof(G));
+  G.nidx = nidx; G.lmb = lmb;
+  int j = 0;
+  for (int i = lnv; i < nn; ++i, ++j) { G.tB[j] = 1ll << np[2 * i]; G.tC[j] = 1ll << np[2 * i + 1]; }
+  for (int i = lmb; i < mm; ++i, ++j) { G.tA[j] = 1ll << mp[2 * i]; G.tC[j] = 1ll << mp[2 * i + 1]; }
+  for (int i = 0; i < bb; ++i, ++j) { G.tA[j] = 1ll << bp[3 * i]; G.tB[j] = 1ll << bp[3 * i + 1]; G.tC[j] = 1ll << bp[3 * i + 2]; }
+  for (int i = 0; i < lmb; ++i) { G.rA[i] = 1ll << mp[2 * i]; G.rC[i] = 1ll << mp[2 * i + 1]; }
+  G.a_kfast = 1;
+  for (int i = 0; i < kk; ++i) {
+    G.kA[i] = 1ll << kp[2 * i]; G.kB[i] = 1ll << kp[2 * i + 1];
+    if (kp[2 * i] != i) G.a_kfast = 0;
+  }
+  G.psa = 1ll << (bb + mm + kk); G.psb = 1ll << (bb + kk + nn); G.psc = 1ll << (bb + mm + nn);
+  op.grid = grid_for(1ll << nidx);
   return 0;
 }
 

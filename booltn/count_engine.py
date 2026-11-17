@@ -52,6 +52,7 @@ def lib():
         L.c8_plan_run.argtypes = [VP, ctypes.c_int, ctypes.c_int]
         L.c8_plan_run_range.argtypes = [VP, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         L.c8_set_cco_impl.argtypes = [ctypes.c_int]
+        L.c8_plan_ccog.argtypes = [VP, VP, VP, VP] + [ctypes.c_int] * 4 + [VP, VP]
         L.c8_set_perm_impl.argtypes = [ctypes.c_int]
         L.c8_make_streams.argtypes = [ctypes.c_int]
         assert L.c8_init() == 0
@@ -109,13 +110,18 @@ def crt(residues, primes):
 class CountTree:
     """Compiled counting plan for one contraction tree (omeco dict) with leaf label lists (rank <= 5)."""
 
-    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned", width=1,
+    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="flex", width=1,
                  dry_run=False):
-        """layout: "planned" (producers emit their consumer's operand layout where possible, see
+        """layout: "flex" (default) = "planned" + small-K GEMMs (ccog) that read their operands and write their
+        output in any label order, so the permutes around them are dropped where the NV-byte vectors (the lowest
+        2-4 labels) agree; "planned" (producers emit their consumer's operand layout where possible, see
         engine.plan_layouts) or "greedy" (per-contraction choice). width: 1 (moduli <= 256) or 2 (moduli
         < 2^16; twice the memory, every tensor as a low-byte and a high-byte plane). dry_run: plan only (no GPU),
         for analysis (self.ops, self.records, self.arena_bytes)."""
-        assert layout in ("planned", "greedy") and width in (1, 2)
+        assert layout in ("flex", "planned", "greedy") and width in (1, 2)
+        flex = layout == "flex"
+        if flex:
+            layout = "planned"
         self.width = width
         L = None if dry_run else lib()
         self.L = L
@@ -206,6 +212,22 @@ class CountTree:
         def tensor_of(d):
             return leaves[d["tensor_index"]] if "tensor_index" in d else small[id(d)]
 
+        # flex: the consumer of every large node and the operand layout it plans to read (for scatter into it)
+        parent_of = {}
+        for dd_id, I in info.items():
+            for side in ("A", "B"):
+                parent_of[id(I[side])] = (dd_id, side)
+
+        def lnv_of(kk):
+            """log2 of the ccov vector bytes (ccov_nv in count8.cu)"""
+            return (4 if kk <= 3 else 3) if width == 1 else (3 if kk <= 3 else 2)
+
+        def planned_operand(pid, side):
+            I, O = info[pid], orders[pid]
+            if side == "A":
+                return I["Ra"], O["K"] + O["M"] + O["B"]
+            return I["Rb"], (O["N"] + O["K"] + O["B"]) if I["kind"] == "cco" else (O["K"] + O["N"] + O["B"])
+
         def build_small(d):
             if "tensor_index" in d or not isinstance(small.get(id(d)), tuple):
                 return
@@ -279,10 +301,49 @@ class CountTree:
             self.records.append((kind, len(Bt), len(Mt), len(Nt), len(Kt), n0, len(ops)))
             return C
 
+        def contract_flex(d, A, B, I, O):
+            """small-K GEMM (ccog) without permutes where possible: A is read in any layout; B in any layout whose
+            lowest lnv labels are N labels (they become the vectors, the other N labels follow B's order); C is
+            written in the planned operand layout of a tc / cc consumer if that starts with the same vectors, else
+            as N + M + batch. Reductions still go through a summing permute (to the planned layout)."""
+            Kt, Mt, Nt, Bt = O["K"], O["M"], O["N"], O["B"]
+            lnv = lnv_of(len(Kt))
+            n0 = len(ops)
+            Nset = set(Nt)
+            if I["Rb"] or not set(B.labels[:lnv]) <= Nset or len(B.labels) < lnv:
+                B2 = permute_spec(B, Nt + Kt + Bt, I["Rb"]); consumed(B, B2)
+            else:
+                B2 = B
+            Nt = [l for l in B2.labels if l in Nset]         # vectors first, then B's order (coalesced lanes)
+            A2 = permute_spec(A, Kt + Mt + Bt, I["Ra"]) if I["Ra"] else A
+            consumed(A, A2)
+            if set(A2.labels[:len(Kt)]) == set(Kt):
+                Kt = A2.labels[:len(Kt)]                       # word loads of A rows
+            Co = Nt + Mt + Bt
+            par = parent_of.get(id(d))
+            if par is not None and info[par[0]]["kind"] != "cco":
+                red, want = planned_operand(*par)
+                if not red and want[:lnv] == Nt[:lnv] and set(want) == set(Co):
+                    Co = want                                  # scatter into the consumer's operand layout
+            C = talloc(Co)
+            pa = {l: i for i, l in enumerate(A2.labels)}
+            pb = {l: i for i, l in enumerate(B2.labels)}
+            pc = {l: i for i, l in enumerate(C.labels)}
+            pos = ([x for l in Bt for x in (pa[l], pb[l], pc[l])] + [x for l in Mt for x in (pa[l], pc[l])]
+                   + [x for l in Nt for x in (pb[l], pc[l])] + [x for l in Kt for x in (pa[l], pb[l])])
+            ops.append(("ccog", A2.off, B2.off, C.off, len(Bt), len(Mt), len(Nt), len(Kt), pos))
+            for t in (A2, B2):
+                if t is not A and t is not B:
+                    tfree(t)
+            self.records.append(("cco", len(Bt), len(Mt), len(Nt), len(Kt), n0, len(ops)))
+            return C
+
         def contract_planned(d, a, b):
             I, O = info[id(d)], orders[id(d)]
             A, B = (b, a) if I["swap"] else (a, b)
             kind = I["kind"]
+            if flex and kind == "cco":
+                return contract_flex(d, A, B, I, O)
             Kt, Mt, Nt, Bt = O["K"], O["M"], O["N"], O["B"]
             n0 = len(ops)
             Ao, Bo, Co = Kt + Mt + Bt, (Nt + Kt + Bt) if kind == "cco" else (Kt + Nt + Bt), Nt + Mt + Bt
@@ -360,6 +421,9 @@ class CountTree:
             elif op[0] == "cco":
                 _, a, b_, c, bb, mm, nn, kk = op
                 r = L.c8_plan_cco(self.plan, B + a, B + b_, B + c, bb, mm, nn, kk, pp)
+            elif op[0] == "ccog":
+                _, a, b_, c, bb, mm, nn, kk, pos = op
+                r = L.c8_plan_ccog(self.plan, B + a, B + b_, B + c, bb, mm, nn, kk, IntArr(pos), pp)
             else:
                 _, a, b_, c, s, bb, mm, nn, kk = op
                 r = L.c8_plan_cc(self.plan, B + a, B + b_, B + c, (B + s) if s is not None else None, bb, mm, nn, kk, pp)
