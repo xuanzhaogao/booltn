@@ -124,22 +124,27 @@ def tree_gpu_time(d, ixs, model=GPU_MODEL):
 
 
 # ---------------------------------------------------------------------------
-# H100 cost model ("h100"): fitted to the booltn kernels on H100 PCIe (booltn-gpu: results/cost_model/bench_kernels_model2.json)
+# H100 cost model ("h100"): fitted to the booltn kernels on H100 PCIe (booltn-gpu: results/cost_model/bench_kernels_v3_model2.json)
 #   per large contraction = launches + permutes of both operands + GEMM (best of cc / tc)
 #   small contractions (out rank <= 14) run batched per tree level -> ~free
 # ---------------------------------------------------------------------------
-# Fitted before perm4 / cc2 / ccd (booltn perm-opt branch): permutes now run at 1.4-1.65 TB/s (perm_bw_bits
-# ~1.2e13), cc on output-heavy shapes at 1.5-1.8 TB/s, tiny-tile tc shapes go to ccd (2-4x faster), and
-# CompiledTree no longer permutes when the producer emits the consumer's layout. Needs a refit
-# (experiments/cost_model) together with treesa_gpu's copy of the model; values kept so both stay in sync.
+# Refitted on results/cost_model/bench_kernels_v3.json (H100 PCIe, booltn 5e2881d kernels: perm4 permutes, cc / cc2 /
+# ccd / tcp CUDA-core kernels, ops replayed as CUDA graphs, tensors up to 2^33 and 2^27 bits) by
+# experiments/cost_model/fit_cost_v2.py, same functional form: the cc branch on the best CUDA-core kernel of each shape
+# (N >= 5), the tc branch on tc. Per-tree modeled vs measured time on 19 trees (random / grid 3-SAT, #SAT networks):
+# log2 error mean +0.12 std 0.52 -> +0.08 std 0.31, rank correlation 0.970 -> 0.981 (results/cost_model/
+# bench_kernels_v3_trees.txt). (A tc branch with K padded to the 1024-bit k-step fits single
+# kernels better, std 0.77 -> 0.35, but overestimates the big compute-bound GEMMs of grid trees; engine.kernel_costs
+# uses it.) Previous constants (v2): perm_bw_bits 8.0e12, cc_bit 6.25e-14, cc_cell 1.97e-14, tc_bit 2.78e-14,
+# tc_pad_cell 7.6e-17, tc_out_bit 2.14e-13. treesa_gpu keeps a copy (trees.py and the binary's defaults).
 H100_MODEL = dict(
     launch=4e-6,             # per kernel launch inside a CUDA graph (s)
-    perm_bw_bits=8.0e12,     # permutation throughput, bits/s each way (~1 TB/s)
-    cc_bit=6.25e-14,         # cc: s per bit moved (A+B+C)
-    cc_cell=1.97e-14,        # cc: s per 2^(B+M+N+K) cell (~100 TOPS)
-    tc_bit=2.78e-14,         # tc: s per bit moved
-    tc_pad_cell=7.6e-17,     # tc: s per padded cell 2^(B+max(M,6)+max(N,6)+max(K,8))
-    tc_out_bit=2.14e-13,     # tc: s per output bit (threshold + pack epilogue)
+    perm_bw_bits=1.23e+13,   # permutation throughput, bits/s each way (perm4: 1.54 TB/s read + write)
+    cc_bit=5.44e-14,         # cc: s per bit moved (A+B+C)
+    cc_cell=7.68e-15,        # cc: s per 2^(B+M+N+K) cell
+    tc_bit=6.37e-14,         # tc: s per bit moved
+    tc_pad_cell=2.02e-16,     # tc: s per padded cell 2^(B+max(M,6)+max(N,6)+max(K,8))
+    tc_out_bit=1.77e-13,      # tc: s per output bit (threshold + pack epilogue)
     small_rank=14,           # contractions with output rank <= this are batched (no permutes)
     small_cell=1e-12,        # s per (output bit x summed combo) in the batched small kernel
 )

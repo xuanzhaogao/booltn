@@ -137,44 +137,67 @@ def plan(La, Lb, Lc):
     return Bt, Kt, Mt, Nt, Ra, Rb
 
 
-# fitted kernel cost model (see py/fit_cost2.py, results/bench_kernels_model2.json). Fitted on cc_kernel and
-# perm2: cc2 (cc with K <= 3 labels, N >= 7) is now 2x faster on output-heavy shapes and ccd is chosen by rule
-# (choose_kind); a refit would move some tcp / tc choices to cc / ccd.
-def kernel_costs(b, m, n, k):
+# Kernel cost model for choose_kind, fitted on results/cost_model/bench_kernels_v3.json (H100 PCIe; ops replayed as
+# CUDA graphs like compiled plans, tensors up to 2^33 and 2^27 bits) by experiments/cost_model/fit_cost_v2.py.
+# Seconds per kernel, with bits = A + B + C bits moved, cells = 2^(B+M+N+K), out = 2^(B+M+N) (C bits):
+#   cc  (bt_gemm_cc; cc2 if K <= 3 and N >= 7 labels, ccs if N < 5, else cc_kernel = cc1): a bits + b cells
+#   ccd (6 <= K <= 10, N >= 5):                               a bits + b cells + c out
+#   tc  (K >= 7, N >= 5):                                     a bits + b padded cells + c out (+ d padded cells if
+#        M < 7: 64-row tiles run one consumer warpgroup), padded cells = 2^(B + max(M,6) + max(N,6) + max(K,10))
+#        (64/128 x 64..256 tiles, 1024-bit k-steps)
+#   tcp (3 <= K <= 6, N >= 5): rows padded to 128 bits + tc at K = 7: a (A + B + 128-bit rows + C bits) + b padded
+#        cells (K = 7 padded to 2^10) + c out (+ d padded cells if M < 7)
+KERNEL_MODEL = dict(
+    cc1=dict(bit=6.9e-14, cell=1.69e-14),
+    cc2=dict(bit=5.12e-14, cell=3.37e-15),
+    ccs=dict(bit=1.92e-13, cell=5.07e-14),     # N < 5: poor fit (log2 err std 1.5), no alternative kernel
+    ccd=dict(bit=5.59e-14, cell=4.56e-15, out=4.94e-13),
+    tc=dict(bit=3.67e-14, pad_cell=2.44e-16, out=1.35e-14, pad_cell_m6=2.05e-16),
+    tcp=dict(bit=7.43e-14, pad_cell=3.11e-16, out=7.34e-14, pad_cell_m6=2.78e-16),
+)
+TC_KPAD = 10
+
+
+def kernel_costs(b, m, n, k, model=None):
     """Modeled seconds per kernel option for a contraction with label counts (B, M, N, K), n >= m."""
+    P = model or KERNEL_MODEL
     a_bits, b_bits, c_bits = 2.0 ** (b + m + k), 2.0 ** (b + n + k), 2.0 ** (b + m + n)
     moved = a_bits + b_bits + c_bits
-    costs = {"cc": 6.25e-14 * moved + 1.97e-14 * 2.0 ** (b + m + n + k)}
+    cells = 2.0 ** (b + m + n + k)
+    f = P["ccs"] if n < 5 else (P["cc2"] if (k <= 3 and n >= 7) else P["cc1"])
+    costs = {"cc": f["bit"] * moved + f["cell"] * cells}
     if n >= 5 and b <= 30:
-        pad_cells = 2.0 ** (b + max(m, 6) + max(n, 6) + max(k, 8))
         if k >= 7:
-            costs["tc"] = 2.78e-14 * moved + 7.6e-17 * pad_cells + 2.14e-13 * c_bits
+            f = P["tc"]
+            pc = 2.0 ** (b + max(m, 6) + max(n, 6) + max(k, TC_KPAD))
+            costs["tc"] = f["bit"] * moved + (f["pad_cell"] + (f["pad_cell_m6"] if m < 7 else 0.0)) * pc + f["out"] * c_bits
         elif k >= 3:
+            f = P["tcp"]
             pad_bits = 128.0 * (2.0 ** (b + m) + 2.0 ** (b + n))
-            costs["tcp"] = (2.78e-14 * (pad_bits + c_bits) + 7.6e-17 * pad_cells + 2.14e-13 * c_bits
-                            + 2 * pad_bits / 8e12 + 8e-6)
+            pc = 2.0 ** (b + max(m, 6) + max(n, 6) + TC_KPAD)
+            costs["tcp"] = (f["bit"] * (a_bits + b_bits + pad_bits + c_bits)
+                            + (f["pad_cell"] + (f["pad_cell_m6"] if m < 7 else 0.0)) * pc + f["out"] * c_bits)
+        if 6 <= k <= 10:
+            f = P["ccd"]
+            costs["ccd"] = f["bit"] * moved + f["cell"] * cells + f["out"] * c_bits
     return costs
 
 
 def choose_kind(Bt, Kt, Mt, Nt):
-    """Pick kernel and operand roles. Returns (swap A<->B, kind in {tc, tcp, cc}).
+    """Pick kernel and operand roles. Returns (swap A<->B, kind in {tc, tcp, cc, ccd}).
 
     tc : 1-bit tensor cores (K >= 7 labels, N >= 5 labels)
     tcp: tensor cores with operand rows zero-padded to 128 bits (3 <= K <= 6 labels)
     cc : CUDA-core masked-OR (any shape; N < 5 packs several rows per output word)
-    ccd: CUDA-core dot products with the tc operand layouts, for tiny tiles: 6 <= K <= 10, M <= 5, N <= 6 labels
-         (measured on the H100: 2-4x faster than tc there, which pads them to 64 x 64 x 1024-bit tiles, and
-         1.2-1.5x faster than cc / tcp at K = 6)
-    Choice = argmin of the fitted cost model, except ccd (rule above; not in the fitted model).
+    ccd: CUDA-core dot products with the tc operand layouts (6 <= K <= 10 labels, N >= 5): tiny tiles
+    Choice = argmin of the fitted cost model (KERNEL_MODEL). On the v3 sweep (662 shapes measured with several kernels) the
+    chosen kernel takes 1.008x the best one's time in total (the previous constants plus a ccd rule: 1.126x).
     """
     m, n = len(Mt), len(Nt)
     swap = m > n  # put the larger free index set on the N (word-packed) side
     if swap:
         m, n = n, m
-    k = len(Kt)
-    if 6 <= k <= 10 and m <= 5 and 5 <= n <= 6:
-        return swap, "ccd"
-    costs = kernel_costs(len(Bt), m, n, k)
+    costs = kernel_costs(len(Bt), m, n, len(Kt))
     kind = min(costs, key=costs.get)
     return swap, kind
 
