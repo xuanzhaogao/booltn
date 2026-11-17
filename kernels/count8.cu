@@ -6,7 +6,8 @@
 // compiled plan / CUDA graph serves every prime.
 //
 // Kernels:
-//   perm8        : label permutation with optional sum (mod p) over dropped labels
+//   perm8        : label permutation with optional sum (mod p) over dropped labels (without sums: perm4, see
+//                  perm4.cuh, a byte tensor being a bit tensor with three more labels; perm8t / perm8 otherwise)
 //   tc8          : batched GEMM on int8 tensor cores (wgmma u8.u8 -> s32), epilogue mod p -> u8
 //   cc8          : batched GEMM on CUDA cores (dp4a), optional split-K via int32 atomics + finalize
 //   small8_batch : many tiny contractions (arbitrary layouts), one block each, one launch per tree level
@@ -20,6 +21,7 @@
 #include <cuda_runtime.h>
 #include "bgemm_sm90.cuh"
 #include "wgmma_u8.inc"
+#include "perm4.cuh"
 
 #define C8_CHECK(x)                                                                              \
   do {                                                                                           \
@@ -743,7 +745,7 @@ static long long grid_for(long long work, int per_block = 256) {
 }
 
 struct Op {
-  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8
+  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4
   int W = 1;     // element width (bytes per residue, in byte planes)
   long long psa = 0, psb = 0, psc = 0;  // W = 2: plane strides of the operands / output
   const uint8_t* a = nullptr;
@@ -753,6 +755,7 @@ struct Op {
   const int* pp = nullptr;
   std::unique_ptr<Perm8Params> perm;
   std::unique_ptr<Perm8TParams> permt;
+  std::unique_ptr<p4::Launch> p4l;   // kind 8: byte permutation as a bit permutation (perm4.cuh)
   Tc8Launch tc;
   long long grid = 1;
   int bb = 0, mm = 0, nn = 0, kk = 0, lks = 0;
@@ -796,6 +799,7 @@ struct Op {
         else add_accum8_kernel<2><<<1, 32, 0, st>>>(acc, a, pp);
         break;
       case 6: perm8t_kernel<<<(int)grid, 256, 0, st>>>(a, c, *permt); break;
+      case 8: C8_CHECK(p4l->launch((const uint32_t*)a, (uint32_t*)c, st)); break;
       case 7:
         if (W == 1) cco8_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk);
         else cco16_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk, psa, psb, psc);
@@ -806,6 +810,8 @@ struct Op {
     return 0;
   }
 };
+
+static int g_perm_impl = 4;  // 4: byte permutations without sums by perm4 where possible (else perm8t / perm8)
 
 struct Plan {
   int W = 1;
@@ -887,6 +893,7 @@ float c8_event_elapsed(void* e0, void* e1) {
   return ms;
 }
 
+int c8_set_perm_impl(int v) { g_perm_impl = v; return 0; }
 void* c8_plan_new() { return new Plan(); }
 // W = 2: every tensor holds 16-bit residues as two byte planes (see ld_el); moduli up to 65536
 void* c8_plan_new_w(int W) {
@@ -915,6 +922,22 @@ int c8_plan_permute(void* h, const uint8_t* in, uint8_t* out, int rout, const in
   op.W = P->W;
   op.psa = 1ll << (rout + nred);  // the input's labels are the output's plus the summed ones
   op.psc = 1ll << rout;
+  if (nred == 0 && g_perm_impl == 4) {
+    // bytes = 8-bit words: bit labels 0..2 stay, byte label q is bit label q + 3 (the W = 2 plane label too)
+    const int rb = rout + P->W - 1 + 3;
+    std::vector<int> bsrc(rb);
+    for (int q = 0; q < 3; ++q) bsrc[q] = q;
+    for (int q = 0; q < rout; ++q) bsrc[q + 3] = src_pos[q] + 3;
+    if (P->W == 2) bsrc[rout + 3] = rout + 3;
+    op.p4l.reset(new p4::Launch);
+    const int rc = p4::prepare(*op.p4l, bsrc.data(), rb, g_nsm);
+    if (rc < 0) { P->ops.pop_back(); return -1; }
+    if (rc > 0) {
+      op.kind = 8;
+      return 0;
+    }
+    op.p4l.reset();
+  }
   if (nred == 0) {
     op.permt.reset(new Perm8TParams);
     std::vector<int> src(src_pos, src_pos + rout);

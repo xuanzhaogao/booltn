@@ -107,13 +107,15 @@ def crt(residues, primes):
 class CountTree:
     """Compiled counting plan for one contraction tree (omeco dict) with leaf label lists (rank <= 5)."""
 
-    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned", width=1):
+    def __init__(self, tree, leaf_labels, small_rc=12, use_graph=True, tc_min_k=5, layout="planned", width=1,
+                 dry_run=False):
         """layout: "planned" (producers emit their consumer's operand layout where possible, see
         engine.plan_layouts) or "greedy" (per-contraction choice). width: 1 (moduli <= 256) or 2 (moduli
-        < 2^16; twice the memory, every tensor as a low-byte and a high-byte plane)."""
+        < 2^16; twice the memory, every tensor as a low-byte and a high-byte plane). dry_run: plan only (no GPU),
+        for analysis (self.ops, self.records, self.arena_bytes)."""
         assert layout in ("planned", "greedy") and width in (1, 2)
         self.width = width
-        L = lib()
+        L = None if dry_run else lib()
         self.L = L
         self.use_graph = use_graph
         self.stream = -1
@@ -317,6 +319,9 @@ class CountTree:
             root = permute_spec(root, [], root.labels)
         assert root.r == 0, f"root must be a scalar, got rank {root.r}"
         self.arena_bytes = arena.top
+        self.ops = ops
+        if dry_run:
+            return
         self.base = L.c8_malloc(self.arena_bytes)
         if not self.base:
             raise MemoryError(f"arena {self.arena_bytes/2**30:.2f} GiB")

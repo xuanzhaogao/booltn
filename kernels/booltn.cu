@@ -4,7 +4,7 @@
 // label at position p contributes 2^p to the linear bit index (position 0 = fastest).
 //
 // Kernels (C API at the bottom, called from Python via ctypes):
-//   bt_permute         : label permutation with optional OR-reduction of dropped labels
+//   bt_permute         : label permutation with optional OR-reduction of dropped labels (tiled: perm4.cuh)
 //   bt_gemm_tc         : batched GEMM on 1-bit tensor cores (wgmma b1 and.popc), K >= 128 bits
 //   bt_gemm_cc         : batched GEMM on CUDA cores, masked-OR formulation, any K, N >= 32 bits
 //   bt_contract_generic: fallback, arbitrary layouts, slow (for tiny contractions)
@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "tc_gemm.cuh"
+#include "perm4.cuh"
 
 #define BT_CHECK(x)                                                                  \
   do {                                                                               \
@@ -538,8 +539,16 @@ static bool plan_perm2(Perm2Params& P, const int* src, int r) {
   std::vector<int> tl_of_in(r, -1);
   for (int k = 0; k < ts; ++k) tl_of_in[Tl[k]] = k;
   // outer labels
+  // outer labels, fastest first: labels that complete the 128-byte lines of the input or of the output (input
+  // position or output position < 10) go first, so the blocks that share a line run at the same time and L2 /
+  // DRAM see full lines and open rows; then by input position
   std::vector<int> Ol;
   for (int q = 0; q < r; ++q) if (tl_of_in[q] < 0) Ol.push_back(q);
+  std::stable_sort(Ol.begin(), Ol.end(), [&](int x, int y) {
+    const int kx = std::min(x, inv[x]) < 10 ? std::min(x, inv[x]) : 64 + x;
+    const int ky = std::min(y, inv[y]) < 10 ? std::min(y, inv[y]) : 64 + y;
+    return kx < ky;
+  });
   P.nouter_bits = (int)Ol.size();
   if (P.nouter_bits > 32) return false;
   P.nouter = 1ll << P.nouter_bits;
@@ -656,16 +665,18 @@ static long long grid_for(long long work, int per_block = 256) {
   return std::max<long long>(1, std::min<long long>(g, (long long)g_nsm * 32));
 }
 
-static int g_perm_impl = 2;  // 2 = use tiled perm2 when applicable, 1 = legacy gather only
+static int g_perm4_maxts = 18, g_perm4_gridmul = 1;
+static int g_perm_impl = 4;  // 4 = perm4 (perm4.cuh) when applicable, else perm2 / gather; 2 = perm2; 1 = gather only
 
 // One prepared kernel launch (all host-side planning done at construction).
 struct Op {
-  int kind = 0;  // 1 perm (gather), 2 perm2 (tiled), 3 cc, 4 tc, 5 generic
+  int kind = 0;  // 1 perm (gather), 2 perm2 (tiled), 3 cc, 4 tc, 5 generic, 11 perm4 (tiled, perm4.cuh)
   const uint32_t* a = nullptr;
   const uint32_t* b = nullptr;
   uint32_t* c = nullptr;
   std::unique_ptr<PermParams> pp;
   std::unique_ptr<Perm2Params> p2;
+  std::unique_ptr<p4::Launch> p4;
   std::unique_ptr<GenParams> gp;
   TcLaunch tc;
   long long grid = 1;
@@ -676,6 +687,9 @@ struct Op {
   int launch(cudaStream_t st) const {
     switch (kind) {
       case 1: perm_kernel<<<(int)grid, 256, 0, st>>>(a, c, *pp); break;
+      case 11:
+        BT_CHECK(p4->launch(a, c, st));
+        break;
       case 2:
         switch (p2->e) {
           case 0: perm2_kernel<0><<<(int)grid, 256, 0, st>>>(a, c, *p2); break;
@@ -727,7 +741,17 @@ static int make_permute(Op& op, const uint32_t* in, int rin, uint32_t* out, int 
   if (nred > 8) return -3;
   op.a = in;
   op.c = out;
-  if (g_perm_impl == 2 && nred == 0 && rin == rout) {
+  if (g_perm_impl == 4 && nred == 0 && rin == rout) {
+    op.p4.reset(new p4::Launch);
+    const int rc = p4::prepare(*op.p4, src_pos, rin, g_nsm, g_perm4_maxts, g_perm4_gridmul);
+    if (rc < 0) return -1;
+    if (rc > 0) {
+      op.kind = 11;
+      return 0;
+    }
+    op.p4.reset();
+  }
+  if (g_perm_impl >= 2 && nred == 0 && rin == rout) {
     op.p2.reset(new Perm2Params);
     if (plan_perm2(*op.p2, src_pos, rin)) {
       op.kind = 2;
@@ -919,6 +943,8 @@ int bt_fill_random(uint32_t* p, long long nwords, unsigned seed, int and_rounds)
 }
 
 int bt_set_perm_impl(int v) { g_perm_impl = v; return 0; }
+int bt_set_perm4_maxts(int v) { g_perm4_maxts = v; return 0; }
+int bt_set_perm4_gridmul(int v) { g_perm4_gridmul = v; return 0; }
 
 int bt_pad_rows(const uint32_t* in, uint32_t* out, int lrows, int kk) {
   if (kk > 6) return -3;

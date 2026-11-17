@@ -17,16 +17,16 @@ LIBS = $(LIBDIR)/libbooltn.so $(LIBDIR)/libcount8.so $(LIBDIR)/libbtmeasure.so
 
 all: $(LIBS)
 
-$(LIBDIR)/libbooltn.so: booltn.cu tc_gemm.cuh bgemm_sm90.cuh wgmma_b1.inc | $(LIBDIR)
+$(LIBDIR)/libbooltn.so: booltn.cu perm4.cuh tc_gemm.cuh bgemm_sm90.cuh wgmma_b1.inc | $(LIBDIR)
 	$(NVCC) $(NVFLAGS) -shared -Xcompiler -fPIC -o $@.tmp booltn.cu && mv -f $@.tmp $@
 
 # multi-GPU variant of libbooltn (device selection + shard exchange), used by booltn.distributed
-$(LIBDIR)/libbooltn_mg.so: booltn_mg.cu booltn.cu tc_gemm.cuh bgemm_sm90.cuh wgmma_b1.inc | $(LIBDIR)
+$(LIBDIR)/libbooltn_mg.so: booltn_mg.cu booltn.cu perm4.cuh tc_gemm.cuh bgemm_sm90.cuh wgmma_b1.inc | $(LIBDIR)
 	$(NVCC) $(NVFLAGS) -shared -Xcompiler -fPIC -o $@.tmp booltn_mg.cu && mv -f $@.tmp $@
 
 mg: $(LIBDIR)/libbooltn_mg.so
 
-$(LIBDIR)/libcount8.so: count8.cu bgemm_sm90.cuh wgmma_u8.inc | $(LIBDIR)
+$(LIBDIR)/libcount8.so: count8.cu perm4.cuh bgemm_sm90.cuh wgmma_u8.inc | $(LIBDIR)
 	$(NVCC) $(NVFLAGS) -shared -Xcompiler -fPIC -o $@.tmp count8.cu && mv -f $@.tmp $@
 
 $(LIBDIR)/libbtmeasure.so: measure.c gf2.c | $(LIBDIR)
