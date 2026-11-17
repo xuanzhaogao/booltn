@@ -163,6 +163,10 @@ if __name__ == "__main__":
         ok &= gemm_test("cc", *args)
     for args in [(0, 2, 3, 12, 251), (1, 1, 2, 14, 241), (0, 0, 0, 16, 251)]:
         ok &= gemm_test("cc_split", *args)
+    # long K, small output (cck): several M x N tiles, partial tiles, K slices, extreme entries (odd seeds)
+    for i, args in enumerate([(2, 3, 4, 13, 251), (0, 4, 5, 10, 256), (0, 2, 4, 18, 241), (3, 1, 1, 9, 7), (1, 0, 6, 12, 256)]):
+        ok &= gemm_test("cc_split", *args, seed=i)
+        ok &= gemm_test("cc_split", *args[:4], (65521, 65519, 40009, 257)[i % 4], seed=i, w=2)
     for args in [(0, 3, 4, 2, 251), (2, 0, 6, 0, 241), (1, 4, 5, 4, 97), (3, 2, 4, 3, 7), (0, 5, 10, 1, 251)]:
         ok &= gemm_test("cco", *args)
     # small-K outer-product kernel (ccov, dp4a): every K, row blocks (M > 16 rows), N = 16 bytes, extreme entries

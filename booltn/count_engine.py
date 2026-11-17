@@ -315,7 +315,13 @@ class CountTree:
             else:
                 B2 = B
             Nt = [l for l in B2.labels if l in Nset]         # vectors first, then B's order (coalesced lanes)
-            A2 = permute_spec(A, Kt + Mt + Bt, I["Ra"]) if I["Ra"] else A
+            kfast = set(A.labels[:len(Kt)]) == set(Kt)
+            # A rows are word loads when A's K labels are lowest, else K byte loads per row: permute a small A
+            # (<= 1/16 of C) instead
+            if I["Ra"] or (not kfast and len(Kt) >= 2 and len(A.labels) + 4 <= len(Nt) + len(Mt) + len(Bt)):
+                A2 = permute_spec(A, Kt + Mt + Bt, I["Ra"])
+            else:
+                A2 = A
             consumed(A, A2)
             if set(A2.labels[:len(Kt)]) == set(Kt):
                 Kt = A2.labels[:len(Kt)]                       # word loads of A rows

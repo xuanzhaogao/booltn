@@ -514,6 +514,112 @@ __global__ void __launch_bounds__(256) cc8_kernel(const uint8_t* __restrict__ A,
   }
 }
 
+// cck: long-K GEMM with a small output (the split-K case of cc8): block = one batch element, an MT x NT tile of
+// outputs and one K slice (blockIdx.y); its 256 threads read the A and B rows of the tile in consecutive 16-byte
+// chunks (coalesced) and keep MT x NT dp4a sums each, reduced over the warp, the block and (atomics into the int32
+// scratch) the K slices. cc8 gave every output its own thread reading 4 bytes per load from 32 different rows
+// per warp (0.4 TB/s on B=7 M=2 N=4 K=21 labels).
+template <int W, int MT, int NT>
+__global__ void __launch_bounds__(256) cck_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                  int* __restrict__ acc, const int* __restrict__ pp, int mm, int nn,
+                                                  int kk, int lks, long long psa, long long psb) {
+  constexpr int NS = W * W;   // plane pairs (00, 01, 10, 11)
+  __shared__ uint32_t red[8][NS][MT][NT];
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  const int M = 1 << mm, N = 1 << nn;
+  const int mt = (M + MT - 1) / MT, nt = (N + NT - 1) / NT;
+  const int tn = blockIdx.x % nt, tm = (blockIdx.x / nt) % mt;
+  const long long b = blockIdx.x / ((long long)nt * mt);
+  const long long Ks = 1ll << (kk - lks);
+  const long long k0 = (long long)blockIdx.y * Ks;
+  const long long nch = Ks >> 4;
+  const uint8_t* ar[MT];
+  const uint8_t* brr[NT];
+#pragma unroll
+  for (int i = 0; i < MT; ++i) {
+    const int m = min(tm * MT + i, M - 1);   // out-of-range rows repeat a valid row (results dropped)
+    ar[i] = A + ((((b << mm) + m)) << kk) + k0;
+  }
+#pragma unroll
+  for (int j = 0; j < NT; ++j) {
+    const int n = min(tn * NT + j, N - 1);
+    brr[j] = B + ((((b << nn) + n)) << kk) + k0;
+  }
+  uint32_t s[NS][MT][NT];
+#pragma unroll
+  for (int q = 0; q < NS; ++q)
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+      for (int j = 0; j < NT; ++j) s[q][i][j] = 0;
+  int since = 0;
+  for (long long c = threadIdx.x; c < nch; c += 256) {
+    uint4 a[W][MT], bv[W][NT];
+#pragma unroll
+    for (int w = 0; w < W; ++w) {
+#pragma unroll
+      for (int i = 0; i < MT; ++i) a[w][i] = __ldg(reinterpret_cast<const uint4*>(ar[i] + (w ? psa : 0)) + c);
+#pragma unroll
+      for (int j = 0; j < NT; ++j) bv[w][j] = __ldg(reinterpret_cast<const uint4*>(brr[j] + (w ? psb : 0)) + c);
+    }
+#pragma unroll
+    for (int wa = 0; wa < W; ++wa)
+#pragma unroll
+      for (int wb = 0; wb < W; ++wb)
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+          for (int j = 0; j < NT; ++j) {
+            uint32_t& x = s[wa * W + wb][i][j];
+            x = __dp4a(a[wa][i].x, bv[wb][j].x, x); x = __dp4a(a[wa][i].y, bv[wb][j].y, x);
+            x = __dp4a(a[wa][i].z, bv[wb][j].z, x); x = __dp4a(a[wa][i].w, bv[wb][j].w, x);
+          }
+    if (++since == 1024) {   // 1024 chunks * 16 * 255^2 < 2^31
+      since = 0;
+#pragma unroll
+      for (int q = 0; q < NS; ++q)
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+          for (int j = 0; j < NT; ++j) s[q][i][j] = modp(s[q][i][j], p, mb);
+    }
+  }
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int q = 0; q < NS; ++q)
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+      for (int j = 0; j < NT; ++j) {
+        uint32_t x = modp(s[q][i][j], p, mb);   // < p: the warp sum stays < 2^21
+#pragma unroll
+        for (int d = 16; d >= 1; d >>= 1) x += __shfl_xor_sync(0xffffffffu, x, d);
+        if (lane == 0) red[warp][q][i][j] = x;
+      }
+  __syncthreads();
+  if (threadIdx.x < MT * NT) {
+    const int i = threadIdx.x / NT, j = threadIdx.x % NT;
+    const int m = tm * MT + i, n = tn * NT + j;
+    if (m < M && n < N) {
+      uint32_t v[NS];
+#pragma unroll
+      for (int q = 0; q < NS; ++q) {
+        uint32_t x = 0;
+#pragma unroll
+        for (int w8 = 0; w8 < 8; ++w8) x += red[w8][q][i][j];
+        v[q] = modp(x, p, mb);
+      }
+      uint32_t r = v[0];
+      if constexpr (W == 2) {   // q = 2 wa + wb: v[0] = A0B0, v[1] = A0B1, v[2] = A1B0, v[3] = A1B1 (Horner)
+        r = modp(v[3], p, mb);
+        r = modp((r << 8) + v[1] + v[2], p, mb);
+        r = modp((r << 8) + v[0], p, mb);
+      }
+      if (r) atomicAdd(acc + (((b << mm) + m) << nn) + n, (int)r);   // <= 2^12 slices * 2^16 < 2^31
+    }
+  }
+}
+
 __global__ void finalize8_kernel(const int* __restrict__ acc, uint8_t* __restrict__ C, const int* __restrict__ pp,
                                  long long n) {
   const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
@@ -975,7 +1081,7 @@ static int ccov_nv(int kk, int W) {
 }
 
 struct Op {
-  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4, 9 ccov, 10 ccog
+  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4, 9 ccov, 10 ccog, 11 cck
   int W = 1;     // element width (bytes per residue, in byte planes)
   long long psa = 0, psb = 0, psc = 0;  // W = 2: plane strides of the operands / output
   const uint8_t* a = nullptr;
@@ -997,6 +1103,18 @@ struct Op {
         if (W == 1) perm8_kernel<1><<<(int)grid, 256, 0, st>>>(a, c, pp, *perm, psa, psc);
         else perm8_kernel<2><<<(int)grid, 256, 0, st>>>(a, c, pp, *perm, psa, psc);
         break;
+      case 11: {   // cck + finalize (lks = log2 K slices)
+        C8_CHECK(cudaMemsetAsync(acc, 0, nout * 4, st));
+        dim3 g((unsigned)grid, 1u << lks);
+        if (W == 1) {
+          cck_kernel<1, 4, 8><<<g, 256, 0, st>>>(a, b, acc, pp, mm, nn, kk, lks, psa, psb);
+          finalize8_kernel<<<(int)grid_for(nout), 256, 0, st>>>(acc, c, pp, nout);
+        } else {
+          cck_kernel<2, 2, 4><<<g, 256, 0, st>>>(a, b, acc, pp, mm, nn, kk, lks, psa, psb);
+          finalize16_kernel<<<(int)grid_for(nout), 256, 0, st>>>(acc, c, pp, nout, psc);
+        }
+        break;
+      }
       case 2: {
         if (lks) C8_CHECK(cudaMemsetAsync(acc, 0, nout * 4, st));
         dim3 g((unsigned)grid, 1u << lks);
@@ -1076,6 +1194,7 @@ struct Op {
   }
 };
 
+static int g_cck_impl = 1;   // 1: long-K small-output GEMMs by cck, 0: cc8 split-K
 static int g_cco_impl = 2;   // 2: ccov (dp4a, B read once per row block), 1: cco8 / cco16
 static int g_perm_impl = 4;  // 4: byte permutations without sums by perm4 where possible (else perm8t / perm8)
 
@@ -1161,6 +1280,7 @@ float c8_event_elapsed(void* e0, void* e1) {
 
 int c8_set_perm_impl(int v) { g_perm_impl = v; return 0; }
 int c8_set_cco_impl(int v) { g_cco_impl = v; return 0; }
+int c8_set_cck_impl(int v) { g_cck_impl = v; return 0; }
 void* c8_plan_new() { return new Plan(); }
 // W = 2: every tensor holds 16-bit residues as two byte planes (see ld_el); moduli up to 65536
 void* c8_plan_new_w(int W) {
@@ -1243,6 +1363,17 @@ int c8_plan_cc(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int* scr
   op.psa = 1ll << (bb + mm + kk); op.psb = 1ll << (bb + nn + kk); op.psc = 1ll << (bb + mm + nn);
   op.nout = 1ll << (bb + mm + nn);
   op.lks = 0;
+  if (scratch && kk >= 9 && g_cck_impl) {
+    // cck: tiles of MT x NT outputs per block, K split into 2^lks slices of >= 2^13 bytes until >= 4 blocks / SM
+    const int MT = P->W == 1 ? 4 : 2, NT = P->W == 1 ? 8 : 4;
+    const long long tiles = (1ll << bb) * (((1ll << mm) + MT - 1) / MT) * (((1ll << nn) + NT - 1) / NT);
+    if (tiles < (1ll << 31)) {
+      op.kind = 11;
+      while (tiles << op.lks < 4ll * g_nsm && kk - op.lks > 13 && op.lks < 12) ++op.lks;
+      op.grid = tiles;
+      return 0;
+    }
+  }
   if (scratch)
     while ((op.nout << op.lks) < (1ll << 17) && kk - op.lks > 8 && op.lks < 12) ++op.lks;
   op.grid = grid_for(op.nout);
