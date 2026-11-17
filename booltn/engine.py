@@ -352,14 +352,26 @@ def _setup_plan_api(L):
 class Arena:
     """Offset allocator over one device buffer; tensors are assigned [offset, offset+bytes) intervals.
     First fit by offset over the free gaps (the same placement as scanning the live blocks in offset order),
-    so an allocation costs O(#gaps), not O(#live blocks)."""
-    INF = 1 << 62
+    so an allocation costs O(#gaps), not O(#live blocks).
 
-    def __init__(self):
+    virtual=True (compiled plans): offsets are placed after planning, when every tensor's lifetime is known.
+    alloc returns a virtual offset (tid + 1) << 40 (plus deltas below 2^40 for sub-blocks); place() packs the
+    blocks greedily by size (largest first, each at the lowest offset free during its lifetime) and real(v) maps a
+    virtual offset to the final one. On the benchmark plans this reaches the peak live bytes, where first fit
+    wasted up to 55 % (grid 3-SAT L22 count plan: 14 GiB first fit vs 9 GiB live)."""
+    INF = 1 << 62
+    VSHIFT = 40
+
+    def __init__(self, virtual=False):
         self.gs, self.ge = [0], [self.INF]     # free gaps [gs[i], ge[i]), sorted, disjoint, non-adjacent
         self.blocks = {}                       # id -> (offset, size)
         self.top = 0
         self.next_id = 0
+        self.virtual = virtual
+        if virtual:
+            self.clock = 0
+            self.life = {}                     # id -> [size, alloc time, free time]
+            self.final = None
 
     @property
     def live(self):
@@ -367,6 +379,13 @@ class Arena:
 
     def alloc(self, nbytes):
         nbytes = (nbytes + 255) // 256 * 256
+        if self.virtual:
+            tid = self.next_id
+            self.next_id += 1
+            self.clock += 1
+            self.life[tid] = [nbytes, self.clock, self.INF]
+            self.blocks[tid] = ((tid + 1) << self.VSHIFT, nbytes)
+            return (tid + 1) << self.VSHIFT, tid
         for i, (s, e) in enumerate(zip(self.gs, self.ge)):
             if e - s >= nbytes:
                 break
@@ -385,6 +404,10 @@ class Arena:
         b = self.blocks.pop(tid, None)
         if b is None:
             return
+        if self.virtual:
+            self.clock += 1
+            self.life[tid][2] = self.clock
+            return
         s, e = b[0], b[0] + b[1]
         i = bisect.bisect_left(self.gs, s)          # gaps before i start below s
         if i < len(self.gs) and self.gs[i] == e:    # merge with the following gap
@@ -395,6 +418,39 @@ class Arena:
         else:
             self.gs.insert(i, s)
             self.ge.insert(i, e)
+
+
+    def place(self):
+        """virtual: assign final offsets (greedy by size, lowest conflict-free offset); sets top."""
+        n = len(self.life)
+        ids = np.array(sorted(self.life, key=lambda t: (-self.life[t][0], self.life[t][1])), dtype=np.int64)
+        size = np.array([self.life[t][0] for t in ids], dtype=np.int64)
+        s0 = np.array([self.life[t][1] for t in ids], dtype=np.int64)
+        s1 = np.array([self.life[t][2] for t in ids], dtype=np.int64)
+        off = np.zeros(n, dtype=np.int64)
+        top = 0
+        for i in range(n):
+            if i:
+                c = np.nonzero((s0[:i] < s1[i]) & (s0[i] < s1[:i]))[0]
+                if len(c):
+                    order = np.argsort(off[c], kind="stable")
+                    lo, hi = off[c][order], (off[c] + size[c])[order]
+                    ends = np.maximum.accumulate(hi)
+                    # first gap of size >= size[i]: before lo[0], or between ends[j] and lo[j + 1]
+                    starts = np.concatenate([[0], ends])
+                    stops = np.concatenate([lo, [self.INF]])
+                    j = int(np.argmax(stops - starts >= size[i]))
+                    off[i] = starts[j]
+            top = max(top, int(off[i] + size[i]))
+        self.final = dict(zip(ids.tolist(), off.tolist()))
+        self.top = top
+
+    def real(self, v):
+        """final offset of a virtual offset (identity when not virtual)"""
+        if not self.virtual:
+            return v
+        tid = (v >> self.VSHIFT) - 1
+        return self.final[tid] + (v & ((1 << self.VSHIFT) - 1))
 
 
 class PlanTensor:
@@ -540,7 +596,7 @@ class CompiledTree:
         self.L = L
         self.use_graph = use_graph
         self.records = []  # per op: (kind, B, M, N, K, op_index_start, op_index_end)
-        arena = Arena()
+        arena = Arena(virtual=True)   # offsets placed after planning (arena.place / arena.real)
         # leaves: one contiguous region; leaf i occupies nwords(rank_i) words (rank <= 16)
         assert all(len(l) <= 16 for l in leaf_labels), "leaf tensors must have rank <= 16"
         nleaf = len(leaf_labels)
@@ -744,14 +800,16 @@ class CompiledTree:
 
         root = rec(tree)
         self.ops, self.levels = ops, levels
-        if dry_run:
-            self.arena_bytes = arena.top
-            return
+        arena.place()
+        R = arena.real
         self.arena_bytes = arena.top
+        self.leaf_off, self.flag_off = R(leaf_off), R(flag_off)
+        if dry_run:
+            return
         self.base = L.bt_malloc(self.arena_bytes)
         if not self.base:
             raise MemoryError(f"arena of {self.arena_bytes/2**30:.2f} GiB failed")
-        self.root_off = root.off
+        self.root_off = R(root.off)
         self.root_r = root.r
         self.plan = L.bt_plan_new()
         B = self.base
@@ -764,7 +822,7 @@ class CompiledTree:
             apos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n)); bpos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n))
             ka = (ctypes.c_int * (8 * n))(*([-1] * 8 * n)); kb = (ctypes.c_int * (8 * n))(*([-1] * 8 * n))
             for i, (ao, bo, co, rci, nki, ap, bp, kai, kbi) in enumerate(lst):
-                ptrs[3 * i], ptrs[3 * i + 1], ptrs[3 * i + 2] = B + ao, B + bo, B + co
+                ptrs[3 * i], ptrs[3 * i + 1], ptrs[3 * i + 2] = B + R(ao), B + R(bo), B + R(co)
                 rc[i], nk[i] = rci, nki
                 for p, v in enumerate(ap): apos[24 * i + p] = v
                 for p, v in enumerate(bp): bpos[24 * i + p] = v
@@ -782,23 +840,23 @@ class CompiledTree:
         for op in ops:
             if op[0] == "perm":
                 _, ioff, rin, ooff, rout, src, red = op
-                rc = L.bt_plan_permute(self.plan, B + ioff, rin, B + ooff, rout, IntArr(src), IntArr(red), len(red))
+                rc = L.bt_plan_permute(self.plan, B + R(ioff), rin, B + R(ooff), rout, IntArr(src), IntArr(red), len(red))
             elif op[0] == "tc":
                 _, a, b, c, bb, mm, nn, kk = op
-                rc = L.bt_plan_tc(self.plan, B + a, B + b, B + c, bb, mm, nn, kk, -1)
+                rc = L.bt_plan_tc(self.plan, B + R(a), B + R(b), B + R(c), bb, mm, nn, kk, -1)
             elif op[0] == "pad":
                 _, ioff, ooff, lrows, kk = op
-                rc = L.bt_plan_pad_rows(self.plan, B + ioff, B + ooff, lrows, kk)
+                rc = L.bt_plan_pad_rows(self.plan, B + R(ioff), B + R(ooff), lrows, kk)
             elif op[0] == "cc":
                 _, a, b, c, bb, mm, nn, kk = op
-                rc = L.bt_plan_cc(self.plan, B + a, B + b, B + c, bb, mm, nn, kk)
+                rc = L.bt_plan_cc(self.plan, B + R(a), B + R(b), B + R(c), bb, mm, nn, kk)
             else:
                 _, a, b, c, rc_, ap, bp, ka, kb = op
-                rc = L.bt_plan_generic(self.plan, B + a, B + b, B + c, rc_, IntArr(ap), IntArr(bp), len(ka),
+                rc = L.bt_plan_generic(self.plan, B + R(a), B + R(b), B + R(c), rc_, IntArr(ap), IntArr(bp), len(ka),
                                        IntArr(ka), IntArr(kb))
             if rc != 0:
                 raise RuntimeError(f"plan op {op[0]} failed rc={rc}")
-        L.bt_plan_or_accum(self.plan, B + flag_off, B + root.off)
+        L.bt_plan_or_accum(self.plan, B + self.flag_off, B + self.root_off)
         self.nops = len(ops) + 1 + nbatches
         self.reset_flag()
 

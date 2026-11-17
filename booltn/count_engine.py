@@ -128,7 +128,7 @@ class CountTree:
         self.use_graph = use_graph
         self.stream = -1
         self.records = []
-        arena = Arena()
+        arena = Arena(virtual=True)   # offsets placed after planning (arena.place / arena.real)
         nleaf = len(leaf_labels)
         assert all(len(l) <= 5 for l in leaf_labels)
         p_off, _ = arena.alloc(4)
@@ -381,7 +381,10 @@ class CountTree:
         if root.r > 0:      # a lone leaf (a one-clause network): sum out its labels
             root = permute_spec(root, [], root.labels)
         assert root.r == 0, f"root must be a scalar, got rank {root.r}"
+        arena.place()
+        R = arena.real
         self.arena_bytes = arena.top
+        self.p_off, self.acc_off, self.leaf_off = R(p_off), R(acc_off), R(leaf_off)
         self.ops = ops
         if dry_run:
             return
@@ -389,7 +392,7 @@ class CountTree:
         if not self.base:
             raise MemoryError(f"arena {self.arena_bytes/2**30:.2f} GiB")
         B = self.base
-        pp = B + p_off
+        pp = B + self.p_off
         self.plan = L.c8_plan_new_w(width)
         nb = 0
         for lev in sorted(levels):
@@ -399,7 +402,7 @@ class CountTree:
             apos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n)); bpos = (ctypes.c_int * (24 * n))(*([-1] * 24 * n))
             ka = (ctypes.c_int * (8 * n))(*([-1] * 8 * n)); kb = (ctypes.c_int * (8 * n))(*([-1] * 8 * n))
             for i, (ao, bo, co, rci, nki, rai, rbi, ap, bp, kai, kbi) in enumerate(lst):
-                ptrs[3 * i], ptrs[3 * i + 1], ptrs[3 * i + 2] = B + ao, B + bo, B + co
+                ptrs[3 * i], ptrs[3 * i + 1], ptrs[3 * i + 2] = B + R(ao), B + R(bo), B + R(co)
                 rc[i], nk[i], ra[i], rb[i] = rci, nki, rai, rbi
                 for q, v in enumerate(ap): apos[24 * i + q] = v
                 for q, v in enumerate(bp): bpos[24 * i + q] = v
@@ -414,22 +417,23 @@ class CountTree:
         for op in ops:
             if op[0] == "perm":
                 _, i, o, rout, src, red = op
-                r = L.c8_plan_permute(self.plan, B + i, B + o, rout, IntArr(src), IntArr(red), len(red), pp)
+                r = L.c8_plan_permute(self.plan, B + R(i), B + R(o), rout, IntArr(src), IntArr(red), len(red), pp)
             elif op[0] == "tc":
                 _, a, b_, c, bb, mm, nn, kk = op
-                r = L.c8_plan_tc(self.plan, B + a, B + b_, B + c, bb, mm, nn, kk, pp)
+                r = L.c8_plan_tc(self.plan, B + R(a), B + R(b_), B + R(c), bb, mm, nn, kk, pp)
             elif op[0] == "cco":
                 _, a, b_, c, bb, mm, nn, kk = op
-                r = L.c8_plan_cco(self.plan, B + a, B + b_, B + c, bb, mm, nn, kk, pp)
+                r = L.c8_plan_cco(self.plan, B + R(a), B + R(b_), B + R(c), bb, mm, nn, kk, pp)
             elif op[0] == "ccog":
                 _, a, b_, c, bb, mm, nn, kk, pos = op
-                r = L.c8_plan_ccog(self.plan, B + a, B + b_, B + c, bb, mm, nn, kk, IntArr(pos), pp)
+                r = L.c8_plan_ccog(self.plan, B + R(a), B + R(b_), B + R(c), bb, mm, nn, kk, IntArr(pos), pp)
             else:
                 _, a, b_, c, s, bb, mm, nn, kk = op
-                r = L.c8_plan_cc(self.plan, B + a, B + b_, B + c, (B + s) if s is not None else None, bb, mm, nn, kk, pp)
+                r = L.c8_plan_cc(self.plan, B + R(a), B + R(b_), B + R(c), (B + R(s)) if s is not None else None, bb, mm,
+                                 nn, kk, pp)
             if r:
                 raise RuntimeError(f"plan op {op[0]} failed rc={r}")
-        L.c8_plan_add_accum(self.plan, B + acc_off, B + root.off, pp)
+        L.c8_plan_add_accum(self.plan, B + self.acc_off, B + R(root.off), pp)
         self.nops = len(ops) + nb + 1
 
     def set_prime(self, p):
