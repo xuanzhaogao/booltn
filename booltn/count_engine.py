@@ -51,6 +51,8 @@ def lib():
         L.c8_plan_cco.argtypes = [VP, VP, VP, VP] + [ctypes.c_int] * 4 + [VP]
         L.c8_plan_run.argtypes = [VP, ctypes.c_int, ctypes.c_int]
         L.c8_plan_run_range.argtypes = [VP, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        L.c8_set_cco_impl.argtypes = [ctypes.c_int]
+        L.c8_set_perm_impl.argtypes = [ctypes.c_int]
         L.c8_make_streams.argtypes = [ctypes.c_int]
         assert L.c8_init() == 0
         _LIB = L

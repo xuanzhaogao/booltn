@@ -248,6 +248,121 @@ __global__ void __launch_bounds__(256) cco16_kernel(const uint8_t* __restrict__ 
   }
 }
 
+// ------------- small-K outer-product GEMM on dp4a (replaces cco8 / cco16 for most shapes) -------------
+// A [b][m][k] (K = 2^KK <= 16 bytes), B [b][k][n] (n fastest), C [b][m][n]. A thread owns NV consecutive n of
+// one batch element and a block of 2^lmb rows m: it loads its K B vectors once, transposes them in registers
+// (prmt, 4x4 bytes) to k-major words T[kb][n] = B[4kb..4kb+3][n], and computes every output of its rows with
+// K/4 dp4a. cco8 re-read the B vectors for every row (M-fold L1/L2 traffic) and spent 2 instructions per
+// multiply-add; this kernel reads B once per 2^lmb rows and is bound by HBM or by the mod-p epilogue.
+// W = 2: 16-bit residues in byte planes; four dp4a sums (planes 00, 01, 10, 11) combined by Horner's rule.
+__device__ __forceinline__ void transpose4x4(uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3, uint32_t& t0,
+                                             uint32_t& t1, uint32_t& t2, uint32_t& t3) {
+  const uint32_t lo01 = __byte_perm(x0, x1, 0x5140), hi01 = __byte_perm(x0, x1, 0x7362);
+  const uint32_t lo23 = __byte_perm(x2, x3, 0x5140), hi23 = __byte_perm(x2, x3, 0x7362);
+  t0 = __byte_perm(lo01, lo23, 0x5410); t1 = __byte_perm(lo01, lo23, 0x7632);
+  t2 = __byte_perm(hi01, hi23, 0x5410); t3 = __byte_perm(hi01, hi23, 0x7632);
+}
+
+template <int NV>
+__device__ __forceinline__ void ld_vec(const uint8_t* p, uint32_t (&w)[NV / 4]) {
+  if constexpr (NV == 16) { const uint4 v = __ldg(reinterpret_cast<const uint4*>(p)); w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w; }
+  else if constexpr (NV == 8) { const uint2 v = __ldg(reinterpret_cast<const uint2*>(p)); w[0] = v.x; w[1] = v.y; }
+  else { w[0] = __ldg(reinterpret_cast<const uint32_t*>(p)); }
+}
+template <int NV>
+__device__ __forceinline__ void st_vec(uint8_t* p, const uint32_t (&w)[NV / 4]) {
+  if constexpr (NV == 16) *reinterpret_cast<uint4*>(p) = make_uint4(w[0], w[1], w[2], w[3]);
+  else if constexpr (NV == 8) *reinterpret_cast<uint2*>(p) = make_uint2(w[0], w[1]);
+  else *reinterpret_cast<uint32_t*>(p) = w[0];
+}
+// the K bytes of an A row as KB words (zero-padded)
+template <int KK>
+__device__ __forceinline__ void ld_arow(const uint8_t* a, uint32_t (&w)[KK >= 2 ? (1 << KK) / 4 : 1]) {
+  if constexpr (KK == 0) w[0] = __ldg(a);
+  else if constexpr (KK == 1) w[0] = (uint32_t)__ldg(a) | ((uint32_t)__ldg(a + 1) << 8);
+  else if constexpr (KK == 2) w[0] = __ldg(reinterpret_cast<const uint32_t*>(a));
+  else if constexpr (KK == 3) { const uint2 v = __ldg(reinterpret_cast<const uint2*>(a)); w[0] = v.x; w[1] = v.y; }
+  else { const uint4 v = __ldg(reinterpret_cast<const uint4*>(a)); w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w; }
+}
+
+template <int KK, int NV, int W>
+__global__ void __launch_bounds__(256) ccov_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                   uint8_t* __restrict__ C, const int* __restrict__ pp, int bb, int mm,
+                                                   int nn, int lmb, long long psa, long long psb, long long psc) {
+  constexpr int K = 1 << KK, KB = KK >= 2 ? K / 4 : 1, NW = NV / 4;
+  constexpr int LNV = NV == 16 ? 4 : NV == 8 ? 3 : 2;
+  const uint32_t p = (uint32_t)*pp, mb = 0xffffffffu / p;
+  const int lnch = nn - LNV, lmbk = mm - lmb;
+  const long long total = 1ll << (bb + lmbk + lnch);
+  for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x; idx < total;
+       idx += (long long)gridDim.x * blockDim.x) {
+    const long long nch = idx & ((1ll << lnch) - 1);
+    const long long t = idx >> lnch;
+    const long long mblk = t & ((1ll << lmbk) - 1);
+    const long long b = t >> lmbk;
+    uint32_t T[W][KB][NV];
+#pragma unroll
+    for (int w = 0; w < W; ++w) {
+      const uint8_t* bp = B + (w ? psb : 0) + ((b << KK) << nn) + (nch << LNV);
+#pragma unroll
+      for (int kb = 0; kb < KB; ++kb) {
+        uint32_t x[4][NW];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int k = 4 * kb + i;
+          if (k < K) ld_vec<NV>(bp + ((long long)k << nn), x[i]);
+          else {
+#pragma unroll
+            for (int q = 0; q < NW; ++q) x[i][q] = 0;
+          }
+        }
+#pragma unroll
+        for (int q = 0; q < NW; ++q)
+          transpose4x4(x[0][q], x[1][q], x[2][q], x[3][q], T[w][kb][4 * q], T[w][kb][4 * q + 1], T[w][kb][4 * q + 2],
+                       T[w][kb][4 * q + 3]);
+      }
+    }
+    for (int r = 0; r < (1 << lmb); ++r) {
+      const long long row = (b << mm) + (mblk << lmb) + r;
+      uint32_t a[W][KB];
+#pragma unroll
+      for (int w = 0; w < W; ++w) ld_arow<KK>(A + (w ? psa : 0) + (row << KK), a[w]);
+      uint32_t o[W][NW];
+#pragma unroll
+      for (int q = 0; q < NW; ++q) {
+#pragma unroll
+        for (int w = 0; w < W; ++w) o[w][q] = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int n = 4 * q + j;
+          uint32_t v;
+          if constexpr (W == 1) {
+            uint32_t s = 0;
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) s = __dp4a(a[0][kb], T[0][kb][n], s);
+            v = modp(s, p, mb);
+          } else {
+            uint32_t s00 = 0, s01 = 0, s10 = 0, s11 = 0;
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) {
+              s00 = __dp4a(a[0][kb], T[0][kb][n], s00); s01 = __dp4a(a[0][kb], T[1][kb][n], s01);
+              s10 = __dp4a(a[1][kb], T[0][kb][n], s10); s11 = __dp4a(a[1][kb], T[1][kb][n], s11);
+            }
+            // plane sums <= 16 * 255^2 < 2^20, so (v << 8) + s01 + s10 < 2^25: three reductions
+            v = modp(s11, p, mb);
+            v = modp((v << 8) + s01 + s10, p, mb);
+            v = modp((v << 8) + s00, p, mb);
+          }
+          o[0][q] |= (v & 0xffu) << (8 * j);
+          if constexpr (W == 2) o[1][q] |= (v >> 8) << (8 * j);
+        }
+      }
+#pragma unroll
+      for (int w = 0; w < W; ++w) st_vec<NV>(C + (w ? psc : 0) + (row << nn) + (nch << LNV), o[w]);
+    }
+  }
+}
+
 // ------------------------------- CUDA-core GEMM (dp4a), split-K --------------------------------
 // A [b][m][k], B [b][n][k] (k fastest, K = 2^kk bytes), C [b][m][n]. Each thread: one output element.
 // lks > 0: blockIdx.y = K chunk; partial sums are atomically added to the int32 scratch `acc` (finalize later).
@@ -744,8 +859,14 @@ static long long grid_for(long long work, int per_block = 256) {
   return std::max<long long>(1, std::min<long long>(g, (long long)g_nsm * 32));
 }
 
+// ccov vector width (bytes of n per thread): T holds W * K/4 * NV words; keep it <= 32 registers
+static int ccov_nv(int kk, int W) {
+  if (W == 1) return kk <= 3 ? 16 : 8;
+  return kk <= 3 ? 8 : 4;
+}
+
 struct Op {
-  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4
+  int kind = 0;  // 1 perm8, 2 cc8, 3 tc8, 4 small batch, 5 add_accum, 6 tiled perm, 7 cco8, 8 perm4, 9 ccov
   int W = 1;     // element width (bytes per residue, in byte planes)
   long long psa = 0, psb = 0, psc = 0;  // W = 2: plane strides of the operands / output
   const uint8_t* a = nullptr;
@@ -804,6 +925,23 @@ struct Op {
         if (W == 1) cco8_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk);
         else cco16_kernel<<<(int)grid, 256, 0, st>>>(a, b, c, pp, 1ll << bb, mm, nn, kk, psa, psb, psc);
         break;
+      case 9: {
+        const int nv = ccov_nv(kk, W);
+#define CCOV(KKk) \
+  if (W == 1) { if (nv == 16) ccov_kernel<KKk, 16, 1><<<(int)grid, 256, 0, st>>>(a, b, c, pp, bb, mm, nn, lks, psa, psb, psc); \
+                else ccov_kernel<KKk, 8, 1><<<(int)grid, 256, 0, st>>>(a, b, c, pp, bb, mm, nn, lks, psa, psb, psc); } \
+  else { if (nv == 8) ccov_kernel<KKk, 8, 2><<<(int)grid, 256, 0, st>>>(a, b, c, pp, bb, mm, nn, lks, psa, psb, psc); \
+         else ccov_kernel<KKk, 4, 2><<<(int)grid, 256, 0, st>>>(a, b, c, pp, bb, mm, nn, lks, psa, psb, psc); }
+        switch (kk) {
+          case 0: CCOV(0); break;
+          case 1: CCOV(1); break;
+          case 2: CCOV(2); break;
+          case 3: CCOV(3); break;
+          default: CCOV(4); break;
+        }
+#undef CCOV
+        break;
+      }
       default: return -9;
     }
     C8_CHECK(cudaGetLastError());
@@ -811,6 +949,7 @@ struct Op {
   }
 };
 
+static int g_cco_impl = 2;   // 2: ccov (dp4a, B read once per row block), 1: cco8 / cco16
 static int g_perm_impl = 4;  // 4: byte permutations without sums by perm4 where possible (else perm8t / perm8)
 
 struct Plan {
@@ -894,6 +1033,7 @@ float c8_event_elapsed(void* e0, void* e1) {
 }
 
 int c8_set_perm_impl(int v) { g_perm_impl = v; return 0; }
+int c8_set_cco_impl(int v) { g_cco_impl = v; return 0; }
 void* c8_plan_new() { return new Plan(); }
 // W = 2: every tensor holds 16-bit residues as two byte planes (see ld_el); moduli up to 65536
 void* c8_plan_new_w(int W) {
@@ -1048,6 +1188,14 @@ int c8_plan_cco(void* h, const uint8_t* A, const uint8_t* B, uint8_t* C, int bb,
   op.W = P->W;
   op.psa = 1ll << (bb + mm + kk); op.psb = 1ll << (bb + kk + nn); op.psc = 1ll << (bb + mm + nn);
   op.grid = grid_for((1ll << (bb + mm + nn - 4)));
+  const int lnv = ccov_nv(kk, P->W) == 16 ? 4 : ccov_nv(kk, P->W) == 8 ? 3 : 2;
+  if (g_cco_impl == 2 && nn >= lnv) {
+    op.kind = 9;
+    op.lks = std::min(mm, 4);   // log2 rows per thread
+    // keep >= 2^16 threads: fewer rows per thread when the grid would be small
+    while (op.lks > 0 && (1ll << (bb + mm - op.lks + nn - lnv)) < (1ll << 16)) --op.lks;
+    op.grid = grid_for(1ll << (bb + mm - op.lks + nn - lnv));
+  }
   return 0;
 }
 

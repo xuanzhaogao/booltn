@@ -114,6 +114,16 @@ if __name__ == "__main__":
         ok &= gemm_test("cc_split", *args)
     for args in [(0, 3, 4, 2, 251), (2, 0, 6, 0, 241), (1, 4, 5, 4, 97), (3, 2, 4, 3, 7), (0, 5, 10, 1, 251)]:
         ok &= gemm_test("cco", *args)
+    # small-K outer-product kernel (ccov, dp4a): every K, row blocks (M > 16 rows), N = 16 bytes, extreme entries
+    # (odd seeds), modulus 256; then the same with the older cco8 / cco16 kernels (c8_set_cco_impl(1))
+    CCO_MORE = [(0, 7, 4, 4, 251, 1), (2, 6, 5, 3, 256, 1), (1, 1, 12, 2, 241, 0), (0, 0, 4, 0, 7, 0),
+                (3, 4, 6, 4, 256, 3), (1, 5, 4, 1, 255, 5), (0, 3, 8, 3, 2, 0)]
+    for impl in (2, 1):
+        L.c8_set_cco_impl(impl)
+        for bb, mm, nn, kk, p, sd in CCO_MORE:
+            ok &= gemm_test("cco", bb, mm, nn, kk, p, seed=sd)
+            ok &= gemm_test("cco", bb, mm, nn, kk, (65521, 65519, 40009, 257)[sd % 4], seed=sd, w=2)
+    L.c8_set_cco_impl(2)
     for args in [(10, 0, 251), (12, 2, 241), (8, 3, 97), (14, 0, 251), (6, 1, 5), (20, 0, 251), (16, 0, 13), (9, 0, 7)]:
         ok &= perm_test(*args)
     # 16-bit residues in byte planes (width 2); odd seeds use all entries p - 1
