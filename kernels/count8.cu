@@ -828,10 +828,71 @@ __global__ void __launch_bounds__(128 * (NWG + 1), MINB)
       wg_wait<0>();
       fence_operands(d);
       if ((threadIdx.x & 31) == 0) mbar_arrive(&S.empty[(it - 1) % STAGES]);
-      // epilogue: d[4j+e] -> row r0 (+8 for e>=2), col 8j + 2*(lane&3) + (e&1); store 2-byte pairs
+      // epilogue: d[4j+e] -> row r0 (+8 for e>=2), col 8j + 2*(lane&3) + (e&1)
       const int lane = threadIdx.x & 31, warp = (threadIdx.x / 32) & 3;
       const int r0 = tm * BM + cw * 64 + 16 * warp + lane / 4;
       uint8_t* Cb = p.C + (long long)b * p.c_batch_stride;
+      if (p.N >= 32) {
+        // rows of >= 32 columns: a 4 x 4 transpose inside each quad (4 shuffles) gives every thread the 8
+        // consecutive columns 8j .. 8j+7 of j = 4s + q, stored as 8 bytes per plane: a warp store writes 32-byte
+        // sectors (the 2-byte stores below wrote 8 bytes per row and instruction; output-bound GEMMs ran at 0.3 TB/s)
+        const int q = lane & 3;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int row = r0 + 8 * h;
+#pragma unroll
+          for (int s4 = 0; s4 < BN / 32; ++s4) {
+            uint32_t e[4];   // element t: columns 8(4 s4 + t) + 2q, +1 as two bytes (W = 1) or two 16-bit residues
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+              const int j = 4 * s4 + t;
+              const uint32_t v0 = modp((uint32_t)d[4 * j + 2 * h], pr, mbar);
+              const uint32_t v1 = modp((uint32_t)d[4 * j + 2 * h + 1], pr, mbar);
+              e[t] = W == 1 ? (v0 | (v1 << 8)) : (v0 | (v1 << 16));
+            }
+            {  // level 1: swap the off-diagonal 2 x 2 blocks with lane ^ 2
+              const bool hi = q & 2;
+              const uint32_t r0_ = __shfl_xor_sync(0xffffffffu, hi ? e[0] : e[2], 2);
+              const uint32_t r1_ = __shfl_xor_sync(0xffffffffu, hi ? e[1] : e[3], 2);
+              if (hi) { e[0] = r0_; e[1] = r1_; } else { e[2] = r0_; e[3] = r1_; }
+            }
+            {  // level 2: transpose inside the 2 x 2 blocks with lane ^ 1
+              const bool odd = q & 1;
+              const uint32_t r0_ = __shfl_xor_sync(0xffffffffu, odd ? e[0] : e[1], 1);
+              const uint32_t r1_ = __shfl_xor_sync(0xffffffffu, odd ? e[2] : e[3], 1);
+              if (odd) { e[0] = r0_; e[2] = r1_; } else { e[1] = r0_; e[3] = r1_; }
+            }
+            // e[i] = columns 8j + 2i, +1 of j = 4 s4 + q
+            if (row >= p.M) continue;
+            uint8_t* dst = Cb + (long long)row * p.N + tn * BN + 8 * (4 * s4 + q);
+            if constexpr (W == 1) {
+              *reinterpret_cast<uint2*>(dst) = make_uint2(e[0] | (e[1] << 16), e[2] | (e[3] << 16));
+            } else {
+              uint32_t r[8];
+#pragma unroll
+              for (int i = 0; i < 4; ++i) { r[2 * i] = e[i] & 0xffffu; r[2 * i + 1] = e[i] >> 16; }
+              if (SPLIT && p.seg > 0) {   // C <- mul * C + v (mod p), C from the previous plane-pair launch
+                const uint2 lo = *reinterpret_cast<const uint2*>(dst), hi = *reinterpret_cast<const uint2*>(dst + p.c_plane);
+                const uint32_t lw[2] = {lo.x, lo.y}, hw[2] = {hi.x, hi.y};
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                  const uint32_t c = ((lw[i / 4] >> (8 * (i % 4))) & 0xffu) | (((hw[i / 4] >> (8 * (i % 4))) & 0xffu) << 8);
+                  r[i] = modp(c * (uint32_t)p.mul + r[i], pr, mbar);
+                }
+              }
+              uint32_t l0 = 0, l1 = 0, h0 = 0, h1 = 0;
+#pragma unroll
+              for (int i = 0; i < 4; ++i) {
+                l0 |= (r[i] & 0xffu) << (8 * i); l1 |= (r[i + 4] & 0xffu) << (8 * i);
+                h0 |= (r[i] >> 8) << (8 * i); h1 |= (r[i + 4] >> 8) << (8 * i);
+              }
+              *reinterpret_cast<uint2*>(dst) = make_uint2(l0, l1);
+              *reinterpret_cast<uint2*>(dst + p.c_plane) = make_uint2(h0, h1);
+            }
+          }
+        }
+        continue;
+      }
 #pragma unroll
       for (int j = 0; j < BN / 8; ++j) {
         const int col = tn * BN + 8 * j + 2 * (lane & 3);
