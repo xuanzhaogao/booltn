@@ -137,7 +137,9 @@ def plan(La, Lb, Lc):
     return Bt, Kt, Mt, Nt, Ra, Rb
 
 
-# fitted kernel cost model (see py/fit_cost2.py, results/bench_kernels_model2.json)
+# fitted kernel cost model (see py/fit_cost2.py, results/bench_kernels_model2.json). Fitted on cc_kernel and
+# perm2: cc2 (cc with K <= 3 labels, N >= 7) is now 2x faster on output-heavy shapes and ccd is chosen by rule
+# (choose_kind); a refit would move some tcp / tc choices to cc / ccd.
 def kernel_costs(b, m, n, k):
     """Modeled seconds per kernel option for a contraction with label counts (B, M, N, K), n >= m."""
     a_bits, b_bits, c_bits = 2.0 ** (b + m + k), 2.0 ** (b + n + k), 2.0 ** (b + m + n)

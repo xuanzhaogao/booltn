@@ -128,6 +128,10 @@ def tree_gpu_time(d, ixs, model=GPU_MODEL):
 #   per large contraction = launches + permutes of both operands + GEMM (best of cc / tc)
 #   small contractions (out rank <= 14) run batched per tree level -> ~free
 # ---------------------------------------------------------------------------
+# Fitted before perm4 / cc2 / ccd (booltn perm-opt branch): permutes now run at 1.4-1.65 TB/s (perm_bw_bits
+# ~1.2e13), cc on output-heavy shapes at 1.5-1.8 TB/s, tiny-tile tc shapes go to ccd (2-4x faster), and
+# CompiledTree no longer permutes when the producer emits the consumer's layout. Needs a refit
+# (experiments/cost_model) together with treesa_gpu's copy of the model; values kept so both stay in sync.
 H100_MODEL = dict(
     launch=4e-6,             # per kernel launch inside a CUDA graph (s)
     perm_bw_bits=8.0e12,     # permutation throughput, bits/s each way (~1 TB/s)
